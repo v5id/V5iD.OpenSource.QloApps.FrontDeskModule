@@ -1,0 +1,141 @@
+/* V5iD Scanner Manager — standalone page (no back-office theme), so this
+   styles the whole document rather than being scoped like frontdesk.css. */
+
+:root {
+    --v5sm-primary: #1a56db;
+    --v5sm-primary-dark: #1543a8;
+    --v5sm-bg: #f8fafc;
+    --v5sm-panel: #ffffff;
+    --v5sm-border: #e2e8f0;
+    --v5sm-text: #1e293b;
+    --v5sm-muted: #64748b;
+    --v5sm-connected: #16a34a;
+    --v5sm-connected-bg: #dcfce7;
+    --v5sm-pending: #f59e0b;
+    --v5sm-pending-bg: #fef3c7;
+    --v5sm-error: #b91c1c;
+    --v5sm-error-bg: #fef2f2;
+}
+
+* {
+    box-sizing: border-box;
+}
+
+body {
+    margin: 0;
+    font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    background: var(--v5sm-bg);
+    color: var(--v5sm-text);
+}
+
+.v5sm-shell {
+    max-width: 480px;
+    margin: 0 auto;
+    padding: 24px 20px 40px;
+}
+
+.v5sm-header h1 {
+    font-size: 18px;
+    margin: 0 0 8px;
+}
+
+.v5sm-hint {
+    font-size: 13px;
+    color: var(--v5sm-muted);
+    line-height: 1.5;
+    margin: 0 0 20px;
+}
+
+.v5sm-warning {
+    background: var(--v5sm-pending-bg);
+    color: #92400e;
+    border: 1px solid var(--v5sm-pending);
+    border-radius: 8px;
+    padding: 12px 14px;
+    font-size: 13px;
+}
+
+.v5sm-row {
+    background: var(--v5sm-panel);
+    border: 1px solid var(--v5sm-border);
+    border-radius: 10px;
+    padding: 14px 16px;
+    margin-bottom: 14px;
+}
+
+.v5sm-row-info {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 10px;
+}
+
+.v5sm-row-info strong {
+    font-size: 14px;
+}
+
+.v5sm-badge {
+    display: inline-block;
+    padding: 3px 10px;
+    border-radius: 999px;
+    font-weight: 700;
+    font-size: 11px;
+    text-transform: uppercase;
+    background: var(--v5sm-border);
+    color: var(--v5sm-muted);
+}
+
+.v5sm-badge.is-connected {
+    background: var(--v5sm-connected-bg);
+    color: var(--v5sm-connected);
+}
+
+.v5sm-badge.is-connecting,
+.v5sm-badge.is-reconnecting {
+    background: var(--v5sm-pending-bg);
+    color: #92400e;
+}
+
+.v5sm-badge.is-error {
+    background: var(--v5sm-error-bg);
+    color: var(--v5sm-error);
+}
+
+.v5sm-btn {
+    display: block;
+    width: 100%;
+    padding: 10px 14px;
+    border: 1px solid var(--v5sm-primary);
+    border-radius: 6px;
+    background: var(--v5sm-primary);
+    color: #fff;
+    font-weight: 600;
+    font-size: 13px;
+    cursor: pointer;
+}
+
+.v5sm-btn:hover {
+    background: var(--v5sm-primary-dark);
+}
+
+.v5sm-btn:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+}
+
+.v5sm-log {
+    margin-top: 10px;
+    font-family: "SFMono-Regular", Consolas, monospace;
+    font-size: 11px;
+    color: var(--v5sm-muted);
+}
+
+.v5sm-log-line {
+    padding: 3px 0;
+    border-top: 1px dashed var(--v5sm-border);
+    word-break: break-all;
+}
+
+.v5sm-log-line:first-child {
+    border-top: none;
+}

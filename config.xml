@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<module>
+	<name>v5idfrontdesk</name>
+	<displayName><![CDATA[V5iD Front Desk]]></displayName>
+	<version><![CDATA[1.0.0]]></version>
+	<description><![CDATA[Room board, guest search, check-in/check-out, room swap and V5iD ID scan verification.]]></description>
+	<author><![CDATA[V5iD, Inc.]]></author>
+	<tab><![CDATA[administration]]></tab>
+	<confirmUninstall><![CDATA[Are you sure you want to uninstall V5iD Front Desk? Scan and activity logs recorded by this module will be deleted.]]></confirmUninstall>
+	<is_configurable>1</is_configurable>
+	<need_instance>0</need_instance>
+	<limited_countries></limited_countries>
+</module>
