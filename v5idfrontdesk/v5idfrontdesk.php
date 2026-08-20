@@ -79,6 +79,10 @@ class V5idFrontDesk extends Module
             'label' => 'Marson Bluetooth Scanner (MT810)',
             'js' => 'views/js/scanners/marson-ble-adapter.js',
         ),
+        'tera-ble' => array(
+            'label' => 'Tera Bluetooth Scanner (HW0009)',
+            'js' => 'views/js/scanners/tera-ble-adapter.js',
+        ),
     );
 
     /** @var string[] Configuration keys removed on uninstall. */
