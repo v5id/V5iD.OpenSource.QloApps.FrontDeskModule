@@ -75,6 +75,10 @@ class V5idFrontDesk extends Module
             'label' => 'MagTek Barcode Scanner (HID)',
             'js' => 'views/js/scanners/magtek-hid-adapter.js',
         ),
+        'marson-ble' => array(
+            'label' => 'Marson Bluetooth Scanner (MT810)',
+            'js' => 'views/js/scanners/marson-ble-adapter.js',
+        ),
     );
 
     /** @var string[] Configuration keys removed on uninstall. */

@@ -57,10 +57,11 @@ Go to **Modules > Module Manager > V5iD Front Desk > Configure**.
    field exists purely to give the test something to authenticate as. It's
    never saved.
 4. **Scanner protocols — all properties** — a system-wide allow-list of
-   scanner adapters (e.g. Inateck Bluetooth, MagTek HID). Turning one on
-   here doesn't connect anything by itself; it just makes that protocol
-   available for pairing in Scanner Manager, which is where a real device
-   serial comes from — see the pairing section below for why that matters.
+   scanner adapters (e.g. Inateck Bluetooth, MagTek HID, Marson Bluetooth).
+   Turning one on here doesn't connect anything by itself; it just makes
+   that protocol available for pairing in Scanner Manager, which is where a
+   real device serial comes from — see the pairing section below for why
+   that matters.
 
 ## Pairing a physical scanner
 
