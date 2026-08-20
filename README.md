@@ -26,11 +26,14 @@ property's verifications — keep that in mind if you manage multiple hotels.
 
 ## Installation
 
-1. Copy (or clone) this module into `modules/v5idfrontdesk` in your QloApps
-   installation.
-2. In the back office, go to **Modules > Module Manager**, find **V5iD
-   Front Desk**, and install it.
-3. A new **Front Desk** tab appears in the main admin menu.
+1. Get the module as a zip file — either zip up this repo yourself, or
+   download a zip from the GitHub release. The zip must contain a single
+   top-level `v5idfrontdesk` folder (with `v5idfrontdesk.php` etc. inside
+   it), not the files loose at the zip root.
+2. In the back office, go to **Modules > Module Manager** and click **Add a
+   new module**.
+3. Select the zip file and click **Upload and install this module**.
+4. A new **Front Desk** tab appears in the main admin menu.
 
 ## Configuration
 
