@@ -229,7 +229,7 @@ class V5idFrontDesk extends Module
      */
     private function installDefaultConfig()
     {
-        return Configuration::updateValue('V5IDFRONTDESK_API_BASE_URL', 'https://test.api.v5id.dev/api/v1')
+        return Configuration::updateValue('V5IDFRONTDESK_API_BASE_URL', 'https://api.v5id.net/api/v1')
             && Configuration::updateValue('V5IDFRONTDESK_ENABLED_SCANNERS', json_encode(array()))
             && Configuration::updateValue('V5IDFRONTDESK_SCHEMA_VERSION', self::SCHEMA_VERSION);
     }
@@ -540,7 +540,7 @@ class V5idFrontDesk extends Module
                         'type' => 'text',
                         'label' => $this->l('API base URL'),
                         'name' => 'V5IDFRONTDESK_API_BASE_URL',
-                        'desc' => $this->l('e.g. https://test.api.v5id.dev/api/v1'),
+                        'desc' => $this->l('e.g. https://api.v5id.net/api/v1'),
                         'required' => true,
                     ),
                     array(
