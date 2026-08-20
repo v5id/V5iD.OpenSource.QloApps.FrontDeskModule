@@ -22,7 +22,7 @@
 	<script src="{$adapterJsUrl}"></script>
 {/foreach}
 <script src="{$channelJsUrl}"></script>
-<script>window.v5idScannerManagerConfig = {$configJson nofilter};</script>
+<script>window.v5idScannerManagerConfig = JSON.parse('{$configJson|escape:'javascript':'UTF-8'}');</script>
 <script src="{$managerAppJsUrl}"></script>
 </body>
 </html>
