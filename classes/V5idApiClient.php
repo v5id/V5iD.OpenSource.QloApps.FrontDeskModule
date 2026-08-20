@@ -1,14 +1,21 @@
 <?php
 /**
- * V5iD Front Desk module for QloApps.
+ * V5id Front Desk module for QloApps.
  *
- * Thin client for the V5iD device-scan validation API.
+ * Thin client for the V5id device-scan validation API.
  *
  * Scope is intentionally limited to the standalone device-scan flow:
  *   POST /security/device/token
  *   POST /security/device/token/refresh
  *   POST /device/validate
  * The richer /verifications/* flow (document images, face liveness) is out of scope.
+ *
+ * One client is scoped to one hotel: base URL, device serial/secret and the
+ * cached token pair all come from that hotel's own
+ * V5idFrontDeskHotelCredential row, never a shared/global credential — see
+ * that class's docblock for why (an owner using a separate V5id
+ * integration ID per property expects the V5id portal itself to only show
+ * that property's verifications, which a shared credential would defeat).
  *
  * Copyright (C) 2026  V5iD, Inc.
  *
@@ -35,15 +42,26 @@ class V5idApiClient
     /** Refresh the access token when fewer than this many seconds remain. */
     const TOKEN_EXPIRY_BUFFER = 60;
 
+    /** @var int */
+    private $idHotel;
+
+    /** @var V5idFrontDeskHotelCredential|null Null when this hotel has no credential configured yet. */
+    private $credential;
+
     /** @var string */
     private $baseUrl;
 
     /** @var Module */
     private $moduleInstance;
 
-    public function __construct()
+    /**
+     * @param int $idHotel
+     */
+    public function __construct($idHotel)
     {
-        $this->baseUrl = rtrim((string) Configuration::get('V5IDFRONTDESK_API_BASE_URL'), '/');
+        $this->idHotel = (int) $idHotel;
+        $this->credential = V5idFrontDeskHotelCredential::getForHotel($this->idHotel);
+        $this->baseUrl = $this->credential ? rtrim((string) $this->credential->api_base_url, '/') : '';
         $this->moduleInstance = Module::getInstanceByName('v5idfrontdesk');
     }
 
@@ -57,6 +75,14 @@ class V5idApiClient
      */
     public function getDeviceToken($forceReauth = false)
     {
+        if (!$this->credential) {
+            return array(
+                'success' => false,
+                'access_token' => null,
+                'message' => $this->l('No V5id credential is configured for this property yet. Set one up under Front Desk settings.'),
+            );
+        }
+
         if (!$forceReauth) {
             $cached = $this->getCachedAccessToken();
             if ($cached !== null) {
@@ -73,7 +99,7 @@ class V5idApiClient
     }
 
     /**
-     * Validates a decoded scan (PDF417 barcode or MRZ) against the V5iD API.
+     * Validates a decoded scan (PDF417 barcode or MRZ) against the V5id API.
      *
      * @param string $rawText The already-decoded scan text, exactly as the scanner emitted it.
      *
@@ -109,12 +135,12 @@ class V5idApiClient
         }
 
         if ($response['http_code'] === 403) {
-            return $this->errorResult($format, $this->l('V5iD rejected the device token for this operation. Re-check the device configuration.'));
+            return $this->errorResult($format, $this->l('V5id rejected the device token for this operation. Re-check this property\'s device configuration.'));
         }
 
         if (!in_array($response['http_code'], array(200, 400), true) || $response['body'] === null) {
             $detail = !empty($response['curl_error']) ? $response['curl_error'] : sprintf($this->l('HTTP %d'), (int) $response['http_code']);
-            return $this->errorResult($format, $this->l('V5iD scan validation failed unexpectedly.').' ('.$detail.')');
+            return $this->errorResult($format, $this->l('V5id scan validation failed unexpectedly.').' ('.$detail.')');
         }
 
         $body = $response['body'];
@@ -139,8 +165,8 @@ class V5idApiClient
      */
     private function getCachedAccessToken()
     {
-        $token = Configuration::get('V5IDFRONTDESK_DEVICE_ACCESS_TOKEN');
-        $expiresAt = (int) Configuration::get('V5IDFRONTDESK_DEVICE_TOKEN_EXPIRES_AT');
+        $token = $this->credential->access_token;
+        $expiresAt = (int) $this->credential->token_expires_at;
 
         if ($token && $expiresAt > (time() + self::TOKEN_EXPIRY_BUFFER)) {
             return $token;
@@ -154,8 +180,8 @@ class V5idApiClient
      */
     private function refreshDeviceToken()
     {
-        $refreshToken = Configuration::get('V5IDFRONTDESK_DEVICE_REFRESH_TOKEN');
-        $refreshExpiresAt = (int) Configuration::get('V5IDFRONTDESK_DEVICE_REFRESH_EXPIRES_AT');
+        $refreshToken = $this->credential->refresh_token;
+        $refreshExpiresAt = (int) $this->credential->refresh_expires_at;
 
         if (!$refreshToken || $refreshExpiresAt <= time()) {
             return array('success' => false, 'access_token' => null, 'message' => $this->l('No usable refresh token cached.'));
@@ -172,7 +198,7 @@ class V5idApiClient
             return array('success' => false, 'access_token' => null, 'message' => $this->extractErrorMessage($response));
         }
 
-        $this->storeTokenPair($response['body']);
+        $this->credential->storeTokenPair($response['body']);
 
         return array('success' => true, 'access_token' => $response['body']['access_token'], 'message' => '');
     }
@@ -182,11 +208,11 @@ class V5idApiClient
      */
     private function issueDeviceToken()
     {
-        $serial = Configuration::get('V5IDFRONTDESK_DEVICE_SERIAL');
-        $secret = Configuration::get('V5IDFRONTDESK_DEVICE_SECRET');
+        $serial = $this->credential->device_serial;
+        $secret = $this->credential->device_secret;
 
         if (!$serial || !$secret) {
-            return array('success' => false, 'access_token' => null, 'message' => $this->l('Device serial number and secret are not configured.'));
+            return array('success' => false, 'access_token' => null, 'message' => $this->l('This property\'s V5id serial number and secret are not fully configured.'));
         }
 
         $response = $this->request(
@@ -199,25 +225,9 @@ class V5idApiClient
             return array('success' => false, 'access_token' => null, 'message' => $this->extractErrorMessage($response));
         }
 
-        $this->storeTokenPair($response['body']);
+        $this->credential->storeTokenPair($response['body']);
 
         return array('success' => true, 'access_token' => $response['body']['access_token'], 'message' => '');
-    }
-
-    /**
-     * @param array $tokenResponse Decoded TokenResponse body.
-     */
-    private function storeTokenPair(array $tokenResponse)
-    {
-        $expiresIn = isset($tokenResponse['expires_in']) ? (int) $tokenResponse['expires_in'] : 0;
-
-        Configuration::updateValue('V5IDFRONTDESK_DEVICE_ACCESS_TOKEN', $tokenResponse['access_token']);
-        Configuration::updateValue('V5IDFRONTDESK_DEVICE_TOKEN_EXPIRES_AT', time() + $expiresIn);
-
-        if (!empty($tokenResponse['refresh_token'])) {
-            Configuration::updateValue('V5IDFRONTDESK_DEVICE_REFRESH_TOKEN', $tokenResponse['refresh_token']);
-            Configuration::updateValue('V5IDFRONTDESK_DEVICE_REFRESH_EXPIRES_AT', time() + (7 * 86400));
-        }
     }
 
     /**

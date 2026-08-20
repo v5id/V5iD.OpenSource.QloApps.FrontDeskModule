@@ -96,6 +96,18 @@ class AdminV5idFrontDeskController extends ModuleAdminController
             Configuration::updateValue('V5IDFRONTDESK_SCAN_LOG_PII_PURGED', 1);
         }
 
+        // Same idea again, for installs that predate the
+        // v5idfrontdesk_scanner_device/v5idfrontdesk_hotel_credential
+        // tables — see V5idFrontDesk::ensureTablesUpToDate(). Runs before
+        // the isScannerManager branch below on purpose: that page's own
+        // AJAX calls (GetScannerDevices etc.) need the tables to already exist.
+        $this->module->ensureTablesUpToDate();
+
+        // And the one-time copy of the old global V5id credential into a
+        // starting row per hotel — must run after ensureTablesUpToDate()
+        // above, since it writes into the table that call just created.
+        $this->module->migrateGlobalCredentialToHotels();
+
         // The Scanner Manager page renders its own standalone HTML document
         // (see renderScannerManagerPage()) instead of the back-office theme,
         // so none of the assets queued below ever get output for it — the
@@ -160,6 +172,11 @@ class AdminV5idFrontDeskController extends ModuleAdminController
      */
     private function renderScannerManagerPage()
     {
+        $idHotel = (int) Tools::getValue('id_hotel');
+        if (!$idHotel || !$this->isHotelAccessible($idHotel)) {
+            die($this->l('You do not have access to this hotel.'));
+        }
+
         $enabledAdapters = V5idFrontDesk::getEnabledScannerAdapters();
 
         $adapterJsUrls = array();
@@ -173,6 +190,16 @@ class AdminV5idFrontDeskController extends ModuleAdminController
             'adapterJsUrls' => $adapterJsUrls,
             'channelJsUrl' => $this->assetUrl('views/js/scanner-channel.js'),
             'managerAppJsUrl' => $this->assetUrl('views/js/scanner-manager-app.js'),
+            // Read by scanner-manager-app.js as window.v5idScannerManagerConfig
+            // — every device list/save/delete call it makes is scoped to
+            // this hotel, both here (what it asks for) and server-side
+            // (ajaxProcessGetScannerDevices() etc. re-check isHotelAccessible
+            // rather than trusting the client).
+            'configJson' => json_encode(array(
+                'idHotel' => $idHotel,
+                'ajaxUrl' => $this->context->link->getAdminLink('AdminV5idFrontDesk'),
+                'token' => $this->token,
+            )),
         ));
 
         die($this->context->smarty->fetch(
@@ -613,7 +640,7 @@ class AdminV5idFrontDeskController extends ModuleAdminController
             $this->dieError($this->l('Empty scan.'));
         }
 
-        $client = new V5idApiClient();
+        $client = new V5idApiClient($idHotel);
         $result = $client->validateScan($raw);
 
         $matches = $result['valid'] ? V5idFrontDeskGuestLocator::matchScanToBooking($result, $idHotel) : array();
@@ -821,5 +848,102 @@ class AdminV5idFrontDeskController extends ModuleAdminController
             'documentNumber' => isset($decoded['documentNumber']) ? (string) $decoded['documentNumber'] : null,
             'address' => isset($decoded['address']) && is_array($decoded['address']) ? $decoded['address'] : array(),
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Known scanner devices (Scanner Manager)
+    // -----------------------------------------------------------------
+
+    /**
+     * Lists the scanners already paired at one hotel. Hard-scoped: a
+     * device registered to a different hotel is never returned here,
+     * regardless of what adapter/serial the caller asks about — see
+     * V5idFrontDeskScannerDevice::getForHotel().
+     */
+    public function ajaxProcessGetScannerDevices()
+    {
+        $idHotel = $this->requireAccessibleHotel();
+
+        $this->ajaxDie(json_encode(array(
+            'success' => true,
+            'devices' => V5idFrontDeskScannerDevice::getForHotel($idHotel) ?: array(),
+        )));
+    }
+
+    /**
+     * Registers a newly-paired device (or re-labels an already-known one —
+     * see V5idFrontDeskScannerDevice::upsert()). The serial comes from the
+     * adapter's own connect() result, captured client-side right after
+     * pairing succeeds — nothing here has to be typed in by staff.
+     */
+    public function ajaxProcessSaveScannerDevice()
+    {
+        $idHotel = $this->requireAccessibleHotel();
+
+        $adapterId = (string) Tools::getValue('adapter_id');
+        $serial = (string) Tools::getValue('serial');
+        $label = trim((string) Tools::getValue('label'));
+
+        if (!array_key_exists($adapterId, V5idFrontDesk::SCANNER_ADAPTERS)) {
+            $this->dieError($this->l('Unknown scanner protocol.'));
+        }
+        if ($serial === '') {
+            $this->dieError($this->l('This device did not report a serial number.'));
+        }
+        if ($label === '') {
+            $label = V5idFrontDesk::SCANNER_ADAPTERS[$adapterId]['label'];
+        }
+
+        if (!V5idFrontDeskScannerDevice::upsert($idHotel, $adapterId, $serial, $label)) {
+            $this->dieError($this->l('Could not save this scanner. Please try again.'));
+        }
+
+        $this->ajaxDie(json_encode(array(
+            'success' => true,
+            'devices' => V5idFrontDeskScannerDevice::getForHotel($idHotel) ?: array(),
+        )));
+    }
+
+    /**
+     * Removes a known device from this hotel's list.
+     */
+    public function ajaxProcessDeleteScannerDevice()
+    {
+        $idHotel = $this->requireAccessibleHotel();
+
+        $idDevice = (int) Tools::getValue('id_device');
+        $device = new V5idFrontDeskScannerDevice($idDevice);
+
+        // The id_hotel on the row itself must match, not just "the caller
+        // has access to *a* hotel" — without this check, a valid session
+        // scoped to Hotel A could delete a device id belonging to Hotel B
+        // simply by guessing/enumerating ids, even though
+        // requireAccessibleHotel() already passed for Hotel A.
+        if (!Validate::isLoadedObject($device) || (int) $device->id_hotel !== $idHotel) {
+            $this->dieError($this->l('Scanner not found.'));
+        }
+
+        if (!$device->delete()) {
+            $this->dieError($this->l('Could not remove this scanner. Please try again.'));
+        }
+
+        $this->ajaxDie(json_encode(array(
+            'success' => true,
+            'devices' => V5idFrontDeskScannerDevice::getForHotel($idHotel) ?: array(),
+        )));
+    }
+
+    /**
+     * @return int The requested id_hotel, or dies with an AJAX error if
+     *             missing or not accessible to the current employee.
+     */
+    private function requireAccessibleHotel()
+    {
+        $idHotel = (int) Tools::getValue('id_hotel');
+        if (!$idHotel || !$this->isHotelAccessible($idHotel)) {
+            $this->dieError($this->l('You do not have access to this hotel.'));
+        }
+
+        return $idHotel;
     }
 }

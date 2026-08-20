@@ -74,6 +74,84 @@ body {
     font-size: 14px;
 }
 
+.v5sm-row-title {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+}
+
+.v5sm-row-sub {
+    font-size: 11px;
+    color: var(--v5sm-muted);
+    font-family: "SFMono-Regular", Consolas, monospace;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.v5sm-row-actions {
+    display: flex;
+    gap: 8px;
+}
+
+.v5sm-row-actions .v5sm-btn {
+    flex: 1;
+}
+
+.v5sm-btn-ghost {
+    padding: 10px 14px;
+    border: 1px solid var(--v5sm-border);
+    border-radius: 6px;
+    background: transparent;
+    color: var(--v5sm-muted);
+    font-weight: 600;
+    font-size: 13px;
+    cursor: pointer;
+}
+
+.v5sm-btn-ghost:hover {
+    background: var(--v5sm-error-bg);
+    color: var(--v5sm-error);
+    border-color: var(--v5sm-error);
+}
+
+.v5sm-muted {
+    font-size: 13px;
+    color: var(--v5sm-muted);
+}
+
+.v5sm-pair {
+    margin-top: 24px;
+    padding-top: 20px;
+    border-top: 1px solid var(--v5sm-border);
+}
+
+.v5sm-pair-title {
+    font-size: 15px;
+    margin: 0 0 12px;
+}
+
+.v5sm-pair-row {
+    display: flex;
+    gap: 8px;
+}
+
+.v5sm-select {
+    flex: 1;
+    padding: 10px 12px;
+    border: 1px solid var(--v5sm-border);
+    border-radius: 6px;
+    background: var(--v5sm-panel);
+    color: var(--v5sm-text);
+    font-size: 13px;
+}
+
+.v5sm-pair-row .v5sm-btn {
+    width: auto;
+    white-space: nowrap;
+}
+
 .v5sm-badge {
     display: inline-block;
     padding: 3px 10px;

@@ -400,13 +400,6 @@
         }
 
         return {
-            id: 'inateck-ble',
-            label: 'Inateck Bluetooth Scanner (BLE)',
-
-            isSupported: function () {
-                return !!navigator.bluetooth;
-            },
-
             /**
              * Opens the browser's device chooser (must be called from a real
              * click handler) and connects to the selected scanner.
@@ -469,5 +462,15 @@
         };
     }
 
-    window.V5idScannerRegistry.register(createAdapter());
+    window.V5idScannerRegistry.register({
+        id: 'inateck-ble',
+        label: 'Inateck Bluetooth Scanner (BLE)',
+        isSupported: function () {
+            return !!navigator.bluetooth;
+        },
+        // A fresh call per physical scanner — see registry.js. createAdapter()
+        // already builds all its state (device/server/GATT handles) inside
+        // its own closure, so it was a factory in everything but name.
+        createInstance: createAdapter,
+    });
 })(window, navigator);

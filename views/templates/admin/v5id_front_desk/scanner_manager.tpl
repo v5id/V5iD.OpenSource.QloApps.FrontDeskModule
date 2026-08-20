@@ -21,6 +21,7 @@
 	<script src="{$adapterJsUrl}"></script>
 {/foreach}
 <script src="{$channelJsUrl}"></script>
+<script>window.v5idScannerManagerConfig = {$configJson nofilter};</script>
 <script src="{$managerAppJsUrl}"></script>
 </body>
 </html>

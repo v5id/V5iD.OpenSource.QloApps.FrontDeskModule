@@ -7,6 +7,11 @@
     'use strict';
 
     var cfg = window.v5idFrontDeskConfig || {};
+    // The scanner channel is scoped per hotel (see scanner-channel.js) and
+    // gets torn down/recreated on hotel switch — see setupScannerChannel().
+    // Only one App instance is ever mounted per page, so a closure-level
+    // variable here is equivalent to an instance property.
+    var scannerChannel = null;
 
     function api(action, params) {
         var body = new URLSearchParams(Object.assign({
@@ -95,7 +100,7 @@
                 // listener needs none of this — it just works, regardless of
                 // what's enabled here.
                 scannerAdapters: cfg.scannerAdapters || [],
-                scannerStatuses: {}, // adapterId -> disconnected|connecting|connected|reconnecting|error
+                scannerStatuses: {}, // deviceId -> disconnected|connecting|connected|reconnecting|error — one entry per physical scanner, see scannerOverallStatus
                 managerAlive: false,
                 managerPollTimer: null,
 
@@ -109,8 +114,14 @@
                 if (!this.managerAlive) {
                     return 'disconnected';
                 }
-                var statuses = this.scannerAdapters.map(function (a) {
-                    return this.scannerStatuses[a.id] || 'disconnected';
+                // scannerStatuses is keyed by deviceId (one entry per
+                // physical scanner, not per protocol) — a property can have
+                // several, so this asks "is any of them connected" rather
+                // than looking up a single status per enabled protocol,
+                // which would have one device's status silently clobber
+                // another's of the same protocol.
+                var statuses = Object.keys(this.scannerStatuses).map(function (deviceId) {
+                    return this.scannerStatuses[deviceId];
                 }.bind(this));
                 if (statuses.indexOf('connected') !== -1) {
                     return 'connected';
@@ -168,38 +179,7 @@
                 window.V5idScannerListener.start(this.handleScan.bind(this));
             }
 
-            var channel = window.V5idScannerChannel;
-            if (channel && channel.isSupported() && this.scannerAdapters.length) {
-                channel.on('scan', function (payload) {
-                    this.handleScan(payload.data);
-                }.bind(this));
-                channel.on('status', function (payload) {
-                    this.scannerStatuses[payload.adapterId] = payload.status;
-                }.bind(this));
-                channel.on('error', function (payload) {
-                    var adapter = this.scannerAdapters.find(function (a) { return a.id === payload.adapterId; });
-                    this.errorMessage = (adapter ? adapter.label : payload.adapterId) + ': ' + payload.message;
-                }.bind(this));
-
-                this.managerAlive = channel.isManagerAlive();
-                if (this.managerAlive) {
-                    // Picks up whatever the manager is already doing — e.g.
-                    // it connected before this tab loaded, or before we
-                    // navigated back to this page — instead of showing
-                    // "disconnected" until its next status change happens
-                    // to broadcast one.
-                    channel.send('query-status');
-                }
-                this.managerPollTimer = window.setInterval(function () {
-                    var alive = channel.isManagerAlive();
-                    if (alive && !this.managerAlive) {
-                        // The manager tab just appeared (or its heartbeat
-                        // just caught back up) — ask it for a fresh snapshot.
-                        channel.send('query-status');
-                    }
-                    this.managerAlive = alive;
-                }.bind(this), 2000);
-            }
+            this.setupScannerChannel();
         },
         beforeUnmount: function () {
             if (window.V5idScannerListener) {
@@ -208,8 +188,86 @@
             if (this.managerPollTimer) {
                 window.clearInterval(this.managerPollTimer);
             }
+            if (scannerChannel) {
+                scannerChannel.close();
+                scannerChannel = null;
+            }
         },
         methods: {
+            /**
+             * (Re)binds the scanner channel to the currently selected
+             * hotel — called on mount and again on every onHotelChange().
+             * Tears down the previous hotel's channel/heartbeat-poll first:
+             * each hotel gets its own BroadcastChannel (see
+             * scanner-channel.js), so switching properties without this
+             * would leave the board listening to the old hotel's channel,
+             * or (worse) never switching at all and mixing signals from
+             * two properties' Scanner Manager tabs together.
+             */
+            setupScannerChannel: function () {
+                if (this.managerPollTimer) {
+                    window.clearInterval(this.managerPollTimer);
+                    this.managerPollTimer = null;
+                }
+                if (scannerChannel) {
+                    scannerChannel.close();
+                    scannerChannel = null;
+                }
+                this.scannerStatuses = {};
+                this.managerAlive = false;
+
+                if (!window.V5idScannerChannel || !this.idHotel || !this.scannerAdapters.length) {
+                    return;
+                }
+
+                scannerChannel = window.V5idScannerChannel.create(this.idHotel);
+                if (!scannerChannel.isSupported()) {
+                    return;
+                }
+
+                // Any message at all proves the manager tab is alive *right
+                // now* — set this directly rather than waiting for the next
+                // managerPollTimer tick (up to 2s away, and background tabs
+                // can throttle setInterval well past that in some browsers).
+                // A reconnecting device is actively sending 'status'
+                // messages, so this makes the badge track it immediately.
+                scannerChannel.on('scan', function (payload) {
+                    this.managerAlive = true;
+                    this.handleScan(payload.data);
+                }.bind(this));
+                scannerChannel.on('status', function (payload) {
+                    this.managerAlive = true;
+                    this.scannerStatuses[payload.deviceId] = payload.status;
+                }.bind(this));
+                scannerChannel.on('error', function (payload) {
+                    this.managerAlive = true;
+                    var adapter = this.scannerAdapters.find(function (a) { return a.id === payload.adapterId; });
+                    this.errorMessage = (adapter ? adapter.label : payload.adapterId) + ': ' + payload.message;
+                }.bind(this));
+
+                this.managerAlive = scannerChannel.isManagerAlive();
+                if (this.managerAlive) {
+                    // Picks up whatever the manager is already doing — e.g.
+                    // it connected before this tab loaded, or before we
+                    // navigated back to this page — instead of showing
+                    // "disconnected" until its next status change happens
+                    // to broadcast one.
+                    scannerChannel.send('query-status');
+                }
+                this.managerPollTimer = window.setInterval(function () {
+                    if (!scannerChannel) {
+                        return;
+                    }
+                    var alive = scannerChannel.isManagerAlive();
+                    if (alive && !this.managerAlive) {
+                        // The manager tab just appeared (or its heartbeat
+                        // just caught back up) — ask it for a fresh snapshot.
+                        scannerChannel.send('query-status');
+                    }
+                    this.managerAlive = alive;
+                }.bind(this), 2000);
+            },
+
             /**
              * Click on the scanner control: opens the Scanner Manager as a
              * normal browser tab (no size/feature string — passing one
@@ -219,7 +277,17 @@
              * opening a new one each time.
              */
             openScannerManager: function () {
-                var win = window.open(cfg.scannerManagerUrl, 'v5idfrontdeskScannerManager');
+                if (!this.idHotel) {
+                    return;
+                }
+                // A separate window name per hotel: switching properties on
+                // the board and clicking this again should open/focus that
+                // property's own Scanner Manager tab, not get stuck
+                // re-focusing whatever hotel's manager happened to be
+                // opened first — scanners are hard-scoped per hotel (see
+                // V5idFrontDeskScannerDevice), so the tabs should be too.
+                var url = cfg.scannerManagerUrl + '&id_hotel=' + encodeURIComponent(this.idHotel);
+                var win = window.open(url, 'v5idfrontdeskScannerManager-' + this.idHotel);
                 if (win) {
                     win.focus();
                 }
@@ -278,6 +346,7 @@
                 this.selected = null;
                 this.loadBoard();
                 this.loadActivity();
+                this.setupScannerChannel();
             },
 
             bookingsForRoomDay: function (idRoom, day) {

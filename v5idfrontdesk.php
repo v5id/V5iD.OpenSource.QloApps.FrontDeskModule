@@ -30,10 +30,20 @@ require_once dirname(__FILE__).'/classes/V5idFrontDeskScanLog.php';
 require_once dirname(__FILE__).'/classes/V5idFrontDeskActivityLog.php';
 require_once dirname(__FILE__).'/classes/V5idFrontDeskGuestLocator.php';
 require_once dirname(__FILE__).'/classes/V5idFrontDeskProfileCheck.php';
+require_once dirname(__FILE__).'/classes/V5idFrontDeskScannerDevice.php';
+require_once dirname(__FILE__).'/classes/V5idFrontDeskHotelCredential.php';
 
 class V5idFrontDesk extends Module
 {
     const CONTROLLER_CLASS = 'AdminV5idFrontDesk';
+
+    /**
+     * Bump whenever createTables() gains a new table, so
+     * ensureTablesUpToDate() knows an existing install needs another pass.
+     * 1 = scan_log/activity_log/scanner_device, 2 = + hotel_credential
+     * (V5id API credentials moved from one global set to one per hotel).
+     */
+    const SCHEMA_VERSION = 2;
 
     /**
      * Known scanner protocol adapters. Each one needing an explicit pairing
@@ -49,6 +59,10 @@ class V5idFrontDesk extends Module
             'label' => 'Inateck Bluetooth Scanner (BLE)',
             'js' => 'views/js/scanners/inateck-ble-adapter.js',
         ),
+        'magtek-hid' => array(
+            'label' => 'MagTek Barcode Scanner (HID)',
+            'js' => 'views/js/scanners/magtek-hid-adapter.js',
+        ),
     );
 
     /** @var string[] Configuration keys removed on uninstall. */
@@ -62,6 +76,9 @@ class V5idFrontDesk extends Module
         'V5IDFRONTDESK_DEVICE_REFRESH_EXPIRES_AT',
         'V5IDFRONTDESK_ENABLED_SCANNERS',
         'V5IDFRONTDESK_SCAN_LOG_PII_PURGED',
+        'V5IDFRONTDESK_TABLES_READY', // legacy — superseded by V5IDFRONTDESK_SCHEMA_VERSION, kept here only to clean up any leftover value
+        'V5IDFRONTDESK_SCHEMA_VERSION',
+        'V5IDFRONTDESK_CREDENTIALS_MIGRATED',
     );
 
     public function __construct()
@@ -151,6 +168,36 @@ class V5idFrontDesk extends Module
                 KEY `idx_booking` (`id_hotel_booking_detail`),
                 KEY `idx_order` (`id_order`)
             ) ENGINE='._MYSQL_ENGINE_.' DEFAULT CHARSET=utf8;',
+
+            'CREATE TABLE IF NOT EXISTS `'._DB_PREFIX_.'v5idfrontdesk_scanner_device` (
+                `id` INT UNSIGNED NOT NULL AUTO_INCREMENT,
+                `id_hotel` INT UNSIGNED NOT NULL,
+                `adapter_id` VARCHAR(32) NOT NULL,
+                `serial` VARCHAR(64) NOT NULL,
+                `label` VARCHAR(64) NOT NULL,
+                `active` TINYINT(1) NOT NULL DEFAULT 1,
+                `date_add` DATETIME NOT NULL,
+                `date_upd` DATETIME NOT NULL,
+                PRIMARY KEY (`id`),
+                UNIQUE KEY `idx_hotel_adapter_serial` (`id_hotel`, `adapter_id`, `serial`),
+                KEY `idx_hotel` (`id_hotel`)
+            ) ENGINE='._MYSQL_ENGINE_.' DEFAULT CHARSET=utf8;',
+
+            'CREATE TABLE IF NOT EXISTS `'._DB_PREFIX_.'v5idfrontdesk_hotel_credential` (
+                `id` INT UNSIGNED NOT NULL AUTO_INCREMENT,
+                `id_hotel` INT UNSIGNED NOT NULL,
+                `api_base_url` VARCHAR(255) NULL,
+                `device_serial` VARCHAR(128) NULL,
+                `device_secret` VARCHAR(255) NULL,
+                `access_token` TEXT NULL,
+                `refresh_token` TEXT NULL,
+                `token_expires_at` INT UNSIGNED NULL,
+                `refresh_expires_at` INT UNSIGNED NULL,
+                `date_add` DATETIME NOT NULL,
+                `date_upd` DATETIME NOT NULL,
+                PRIMARY KEY (`id`),
+                UNIQUE KEY `idx_hotel` (`id_hotel`)
+            ) ENGINE='._MYSQL_ENGINE_.' DEFAULT CHARSET=utf8;',
         );
 
         foreach ($queries as $query) {
@@ -167,7 +214,7 @@ class V5idFrontDesk extends Module
      */
     private function dropTables()
     {
-        $tables = array('v5idfrontdesk_scan_log', 'v5idfrontdesk_activity_log');
+        $tables = array('v5idfrontdesk_scan_log', 'v5idfrontdesk_activity_log', 'v5idfrontdesk_scanner_device', 'v5idfrontdesk_hotel_credential');
         foreach ($tables as $table) {
             if (!Db::getInstance()->execute('DROP TABLE IF EXISTS `'._DB_PREFIX_.bqSQL($table).'`')) {
                 return false;
@@ -183,7 +230,71 @@ class V5idFrontDesk extends Module
     private function installDefaultConfig()
     {
         return Configuration::updateValue('V5IDFRONTDESK_API_BASE_URL', 'https://test.api.v5id.dev/api/v1')
-            && Configuration::updateValue('V5IDFRONTDESK_ENABLED_SCANNERS', json_encode(array()));
+            && Configuration::updateValue('V5IDFRONTDESK_ENABLED_SCANNERS', json_encode(array()))
+            && Configuration::updateValue('V5IDFRONTDESK_SCHEMA_VERSION', self::SCHEMA_VERSION);
+    }
+
+    /**
+     * Self-heals table schema for installs that predate a newer table —
+     * createTables() is idempotent (CREATE TABLE IF NOT EXISTS for each),
+     * so safe to call again on an existing install. Gated by a version
+     * counter rather than a one-shot boolean flag: a plain "tables are
+     * ready" flag would never run again once set, even after a later
+     * change added yet another new table (exactly what happened between
+     * v5idfrontdesk_scanner_device and v5idfrontdesk_hotel_credential —
+     * bump SCHEMA_VERSION whenever createTables() gains a new table, and
+     * every install below that number picks up the difference on its next
+     * page load. See AdminV5idFrontDeskController::setMedia() for the call site.
+     *
+     * @return void
+     */
+    public function ensureTablesUpToDate()
+    {
+        if ((int) Configuration::get('V5IDFRONTDESK_SCHEMA_VERSION') >= self::SCHEMA_VERSION) {
+            return;
+        }
+
+        if ($this->createTables()) {
+            Configuration::updateValue('V5IDFRONTDESK_SCHEMA_VERSION', self::SCHEMA_VERSION);
+        }
+    }
+
+    /**
+     * One-time migration for installs that had a single global V5id
+     * credential before it became per-hotel: copies it into a starting row
+     * for every hotel that doesn't already have its own, so existing scan
+     * validation doesn't just stop working the moment this ships. An
+     * owner can then replace it with a distinct credential per property —
+     * see V5idFrontDeskHotelCredential's own docblock for why that matters
+     * (it's what makes the V5id portal itself show only one property's
+     * verifications per login). Gated by a config flag, not
+     * SCHEMA_VERSION: this only needs to run once ever, regardless of how
+     * many more tables get added later. See
+     * AdminV5idFrontDeskController::setMedia() for the call site.
+     *
+     * @return void
+     */
+    public function migrateGlobalCredentialToHotels()
+    {
+        if (Configuration::get('V5IDFRONTDESK_CREDENTIALS_MIGRATED')) {
+            return;
+        }
+
+        $baseUrl = trim((string) Configuration::get('V5IDFRONTDESK_API_BASE_URL'));
+        $serial = trim((string) Configuration::get('V5IDFRONTDESK_DEVICE_SERIAL'));
+        $secret = trim((string) Configuration::get('V5IDFRONTDESK_DEVICE_SECRET'));
+
+        if ($baseUrl && $serial && $secret) {
+            $hotels = Db::getInstance()->executeS('SELECT id FROM `'._DB_PREFIX_.'htl_branch_info`');
+            foreach ($hotels ?: array() as $hotel) {
+                $idHotel = (int) $hotel['id'];
+                if (!V5idFrontDeskHotelCredential::getForHotel($idHotel)) {
+                    V5idFrontDeskHotelCredential::saveForHotel($idHotel, $baseUrl, $serial, $secret);
+                }
+            }
+        }
+
+        Configuration::updateValue('V5IDFRONTDESK_CREDENTIALS_MIGRATED', 1);
     }
 
     /**
@@ -289,6 +400,14 @@ class V5idFrontDesk extends Module
             $this->registerHook('displayBackOfficeHeader');
         }
 
+        // This page can be the very first one an admin opens after an
+        // upgrade — AdminV5idFrontDeskController::setMedia() never runs in
+        // that case, so the same self-heals need to happen here too.
+        $this->ensureTablesUpToDate();
+        $this->migrateGlobalCredentialToHotels();
+
+        $idHotel = $this->getSelectedHotelId();
+
         $output = '';
 
         // HelperForm always injects a hidden `<submit_action>=1` field, so
@@ -297,49 +416,78 @@ class V5idFrontDesk extends Module
         // checked first.
         if (Tools::isSubmit('submitV5idFrontDeskTestConnection')) {
             // Save before testing: V5idApiClient reads its base URL/serial/
-            // secret straight from Configuration, not from this request's
-            // POST data, so testing without saving first would silently
-            // re-test whatever was already in the database — not whatever
+            // secret from this hotel's own stored row, not from this
+            // request's POST data, so testing without saving first would
+            // silently re-test whatever was already saved — not whatever
             // was just typed into the form.
-            $saveResult = $this->processSettingsSubmit();
+            $saveResult = $this->processSettingsSubmit($idHotel);
             $output .= $saveResult['html'];
             if ($saveResult['success']) {
-                $output .= $this->processTestConnection();
+                $output .= $this->processTestConnection($idHotel);
             }
         } elseif (Tools::isSubmit('submitV5idFrontDeskSettings')) {
-            $output .= $this->processSettingsSubmit()['html'];
+            $output .= $this->processSettingsSubmit($idHotel)['html'];
         }
 
-        return $output.$this->renderSettingsForm();
+        return $output.$this->renderSettingsForm($idHotel);
     }
 
     /**
+     * @return int Id of the hotel currently selected for credential
+     *             editing — from ?id_hotel=, falling back to the first
+     *             hotel in the system. 0 if there are no hotels at all.
+     */
+    private function getSelectedHotelId()
+    {
+        $requested = (int) Tools::getValue('id_hotel');
+        $hotels = $this->getAllHotels();
+
+        foreach ($hotels as $hotel) {
+            if ((int) $hotel['id'] === $requested) {
+                return $requested;
+            }
+        }
+
+        return $hotels ? (int) $hotels[0]['id'] : 0;
+    }
+
+    /**
+     * Every hotel in the system, not just the ones the current employee
+     * happens to be assigned to — this is a superadmin-level configuration
+     * page, unlike the front desk board's own employee-scoped hotel list.
+     *
+     * @return array<int, array{id: string, hotel_name: string}>
+     */
+    private function getAllHotels()
+    {
+        return (new HotelBranchInformation())->hotelsNameAndId() ?: array();
+    }
+
+    /**
+     * @param int $idHotel
+     *
      * @return array{html: string, success: bool}
      */
-    private function processSettingsSubmit()
+    private function processSettingsSubmit($idHotel)
     {
         $baseUrl = trim((string) Tools::getValue('V5IDFRONTDESK_API_BASE_URL'));
         $serial = trim((string) Tools::getValue('V5IDFRONTDESK_DEVICE_SERIAL'));
         $secret = trim((string) Tools::getValue('V5IDFRONTDESK_DEVICE_SECRET'));
 
+        if (!$idHotel) {
+            return array('html' => $this->displayError($this->l('Select a property first.')), 'success' => false);
+        }
+
         if (!$baseUrl || !Validate::isAbsoluteUrl($baseUrl)) {
             return array('html' => $this->displayError($this->l('Please enter a valid API base URL.')), 'success' => false);
         }
 
-        Configuration::updateValue('V5IDFRONTDESK_API_BASE_URL', rtrim($baseUrl, '/'));
-        Configuration::updateValue('V5IDFRONTDESK_DEVICE_SERIAL', $serial);
-
-        // Only overwrite the stored secret when the admin actually typed a new one,
-        // so re-saving the form doesn't blank it out.
-        if ($secret !== '') {
-            Configuration::updateValue('V5IDFRONTDESK_DEVICE_SECRET', $secret);
+        // saveForHotel() only touches the cached token (clearing it) when a
+        // genuinely new secret is passed — an empty string here means
+        // "leave the currently saved secret alone", same as before.
+        if (!V5idFrontDeskHotelCredential::saveForHotel($idHotel, $baseUrl, $serial, $secret)) {
+            return array('html' => $this->displayError($this->l('Could not save these credentials. Please try again.')), 'success' => false);
         }
-
-        // Credentials changed: drop any cached token so the next call re-authenticates.
-        Configuration::deleteByName('V5IDFRONTDESK_DEVICE_ACCESS_TOKEN');
-        Configuration::deleteByName('V5IDFRONTDESK_DEVICE_REFRESH_TOKEN');
-        Configuration::deleteByName('V5IDFRONTDESK_DEVICE_TOKEN_EXPIRES_AT');
-        Configuration::deleteByName('V5IDFRONTDESK_DEVICE_REFRESH_EXPIRES_AT');
 
         $enabledScanners = array();
         foreach (array_keys(self::SCANNER_ADAPTERS) as $adapterId) {
@@ -353,11 +501,13 @@ class V5idFrontDesk extends Module
     }
 
     /**
+     * @param int $idHotel
+     *
      * @return string
      */
-    private function processTestConnection()
+    private function processTestConnection($idHotel)
     {
-        $client = new V5idApiClient();
+        $client = new V5idApiClient($idHotel);
         $result = $client->getDeviceToken(true);
 
         if ($result['success']) {
@@ -368,18 +518,24 @@ class V5idFrontDesk extends Module
     }
 
     /**
+     * @param int $idHotel
+     *
      * @return string
      */
-    private function renderSettingsForm()
+    private function renderSettingsForm($idHotel)
     {
         $fieldsForm = array(
             'form' => array(
                 'legend' => array(
-                    'title' => $this->l('V5iD device credentials'),
+                    'title' => $this->l('V5id API credentials for this property'),
                     'icon' => 'icon-key',
                 ),
-                'description' => $this->l('Enter the device credentials issued by the V5iD portal for the ID scanner used at this front desk. These are exchanged server-side for a short-lived device token used to validate scans — they are never sent to the browser.'),
+                'description' => $this->l('Each property has its own V5id integration credential — an owner using a separate integration ID per property will only see that property\'s verifications when logging into the V5id portal, and this is what makes that possible. These are exchanged server-side for a short-lived token used to validate scans — never sent to the browser. Physical scanner hardware is a separate concept: it\'s paired per property in that property\'s own Scanner Manager (open it from the Front Desk screen), not here.'),
                 'input' => array(
+                    array(
+                        'type' => 'hidden',
+                        'name' => 'id_hotel',
+                    ),
                     array(
                         'type' => 'text',
                         'label' => $this->l('API base URL'),
@@ -389,15 +545,16 @@ class V5idFrontDesk extends Module
                     ),
                     array(
                         'type' => 'text',
-                        'label' => $this->l('Device serial number'),
+                        'label' => $this->l('V5id serial number'),
                         'name' => 'V5IDFRONTDESK_DEVICE_SERIAL',
+                        'desc' => $this->l('This property\'s API credential from the V5id portal — not a physical scanner\'s serial number (those are paired per property in Scanner Manager).'),
                         'required' => true,
                     ),
                     array(
                         'type' => 'password',
-                        'label' => $this->l('Device secret'),
+                        'label' => $this->l('V5id secret'),
                         'name' => 'V5IDFRONTDESK_DEVICE_SECRET',
-                        'desc' => $this->l('Leave blank to keep the currently saved secret.'),
+                        'desc' => $this->l('Leave blank to keep this property\'s currently saved secret.'),
                         'required' => false,
                     ),
                 ),
@@ -420,10 +577,10 @@ class V5idFrontDesk extends Module
         $scannerFieldsForm = array(
             'form' => array(
                 'legend' => array(
-                    'title' => $this->l('Scanner protocols'),
+                    'title' => $this->l('Scanner protocols — all properties'),
                     'icon' => 'icon-barcode',
                 ),
-                'description' => $this->l('Turn on the scanner protocols in use at this property. Each one is a self-contained adapter, so new scanner brands/protocols can be added here later without changing the front desk screen itself. Scanners that just type plain keystrokes (most USB/Bluetooth-HID barcode scanners) need nothing enabled here — they work automatically.'),
+                'description' => $this->l('A system-wide allow-list, not specific to one property: turn on the scanner protocols available anywhere in this installation. Each one is a self-contained adapter, so a new scanner brand can be added later without changing the front desk screen itself. Enabling a protocol here doesn\'t connect anything by itself — each property still pairs its own specific scanner(s) separately, in that property\'s own Scanner Manager (open it from the Front Desk screen). Scanners that just type plain keystrokes (most USB/Bluetooth-HID barcode scanners) need nothing enabled here at all — they work automatically.'),
                 'input' => array(
                     array(
                         'type' => 'checkbox',
@@ -450,15 +607,60 @@ class V5idFrontDesk extends Module
         $helper->allow_employee_form_lang = Configuration::get('PS_BO_ALLOW_EMPLOYEE_FORM_LANG') ? Configuration::get('PS_BO_ALLOW_EMPLOYEE_FORM_LANG') : 0;
         $helper->identifier = $this->identifier;
         $helper->submit_action = 'submitV5idFrontDeskSettings';
-        $helper->currentIndex = $this->context->link->getAdminLink('AdminModules', false).'&configure='.$this->name.'&tab_module='.$this->tab.'&module_name='.$this->name;
+        $helper->currentIndex = $this->context->link->getAdminLink('AdminModules', false).'&configure='.$this->name.'&tab_module='.$this->tab.'&module_name='.$this->name.'&id_hotel='.(int) $idHotel;
         $helper->token = Tools::getAdminTokenLite('AdminModules');
         $helper->tpl_vars = array(
-            'fields_value' => $this->getConfigFieldsValues(),
+            'fields_value' => $this->getConfigFieldsValues($idHotel),
             'languages' => $this->context->controller->getLanguages(),
             'id_language' => $this->context->language->id,
         );
 
-        return $helper->generateForm(array($fieldsForm, $scannerFieldsForm));
+        return $this->renderHotelPicker($idHotel).$helper->generateForm(array($fieldsForm, $scannerFieldsForm));
+    }
+
+    /**
+     * A small property switcher above the credentials form — a plain GET
+     * form (not a HelperForm field) since all it does is reload this page
+     * scoped to a different id_hotel. Hidden fields carry the rest of the
+     * URL rather than relying on the <form action="">'s own query string:
+     * browsers replace a GET form's action query string with the form's
+     * own fields on submit, they don't merge the two.
+     *
+     * @param int $idHotel
+     *
+     * @return string
+     */
+    private function renderHotelPicker($idHotel)
+    {
+        $hotels = $this->getAllHotels();
+        if (!$hotels) {
+            return $this->displayError($this->l('No properties found. Add one under Hotel Reservation System first.'));
+        }
+
+        // Each <option> carries its own complete, already-tokened URL
+        // (built the exact same way PrestaShop's own "Configure" links
+        // are, via Link::getAdminLink()) rather than assembling a <form>
+        // with hidden fields and a hand-computed token — one less place
+        // for the request PrestaShop actually receives to end up subtly
+        // different from a normal navigation.
+        $html = '<div class="panel">';
+        $html .= '<div class="panel-heading"><i class="icon-building"></i> '.$this->l('Property').'</div>';
+        $html .= '<div style="padding: 15px;">';
+        $html .= '<label style="margin-right: 10px; font-weight: 600;">'.$this->l('Editing V5id credentials for:').'</label> ';
+        $html .= '<select onchange="if (this.value) { window.location.href = this.value; }" style="min-width: 260px;">';
+        foreach ($hotels as $hotel) {
+            $link = $this->context->link->getAdminLink('AdminModules')
+                .'&configure='.$this->name
+                .'&tab_module='.$this->tab
+                .'&module_name='.$this->name
+                .'&id_hotel='.(int) $hotel['id'];
+            $selected = ((int) $hotel['id'] === (int) $idHotel) ? ' selected="selected"' : '';
+            $html .= '<option value="'.htmlspecialchars($link, ENT_QUOTES).'"'.$selected.'>'.htmlspecialchars($hotel['hotel_name'], ENT_QUOTES).'</option>';
+        }
+        $html .= '</select>';
+        $html .= '</div></div>';
+
+        return $html;
     }
 
     /**
@@ -475,18 +677,26 @@ class V5idFrontDesk extends Module
     }
 
     /**
+     * @param int $idHotel
+     *
      * @return array
      */
-    private function getConfigFieldsValues()
+    private function getConfigFieldsValues($idHotel)
     {
+        $credential = V5idFrontDeskHotelCredential::getForHotel($idHotel);
+
         $fields = array(
+            'id_hotel' => (int) $idHotel,
             'V5IDFRONTDESK_API_BASE_URL' => Tools::getValue(
                 'V5IDFRONTDESK_API_BASE_URL',
-                Configuration::get('V5IDFRONTDESK_API_BASE_URL')
+                // A hotel with nothing configured yet falls back to the old
+                // installation-wide default, purely to pre-fill a sensible
+                // starting URL — not read at scan-validation time anymore.
+                $credential ? $credential->api_base_url : Configuration::get('V5IDFRONTDESK_API_BASE_URL')
             ),
             'V5IDFRONTDESK_DEVICE_SERIAL' => Tools::getValue(
                 'V5IDFRONTDESK_DEVICE_SERIAL',
-                Configuration::get('V5IDFRONTDESK_DEVICE_SERIAL')
+                $credential ? $credential->device_serial : ''
             ),
             'V5IDFRONTDESK_DEVICE_SECRET' => '',
         );
