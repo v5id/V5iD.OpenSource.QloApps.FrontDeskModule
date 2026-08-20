@@ -233,7 +233,7 @@
                 // messages, so this makes the badge track it immediately.
                 scannerChannel.on('scan', function (payload) {
                     this.managerAlive = true;
-                    this.handleScan(payload.data);
+                    this.handleScan(payload.data, payload.serial);
                 }.bind(this));
                 scannerChannel.on('status', function (payload) {
                     this.managerAlive = true;
@@ -517,12 +517,21 @@
                 }.bind(this));
             },
 
-            handleScan: function (raw) {
+            /**
+             * @param {string} raw Already-decoded scan text (barcode/MRZ).
+             * @param {string} [serial] The paired device's serial (see
+             *   scanner-manager-app.js's onScan), forwarded straight to
+             *   V5id's scan-validation API, which requires one on every
+             *   request. Undefined for a plain keyboard-wedge scan (see
+             *   scanner-listener.js) — the server reports a clean "no
+             *   known device" error for those rather than calling the API.
+             */
+            handleScan: function (raw, serial) {
                 if (!this.idHotel) {
                     return;
                 }
                 this.scanBanner = { loading: true };
-                api('ScanValidate', { id_hotel: this.idHotel, scan: raw }).then(function (res) {
+                api('ScanValidate', { id_hotel: this.idHotel, scan: raw, device_serial: serial || '' }).then(function (res) {
                     if (!res.success) {
                         this.scanBanner = { loading: false, error: res.message || 'Scan failed.' };
                         return;

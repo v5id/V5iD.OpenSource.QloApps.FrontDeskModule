@@ -12,17 +12,22 @@ physical ID scanners.
 >
 > 👉 [https://portal.v5id.net/](https://portal.v5id.net/)
 
-Each property (hotel) needs its own V5iD integration credential — a
-**serial** and **secret** — issued from the portal. The module exchanges
-these server-side for a short-lived API token used to validate ID scans; it
-never sends your secret to the browser. Register your property and generate
-its credential on the portal *first*, then come back and enter it in the
-module settings below. Without a valid credential, scan verification will
-fail even if a scanner is physically connected.
+Each property (hotel) needs its own V5iD integration **secret** issued from
+the portal, and each physical scanner needs its own **serial number**
+registered there too — the V5iD API issues a token per device (secret +
+serial together) and rejects any request that doesn't carry a registered
+serial. The module exchanges these server-side for a short-lived token used
+to validate ID scans, scoped to that specific device; it never sends your
+secret to the browser, and a token issued for one device can't be reused for
+another. Register your property (for the secret) and each scanner unit (for
+its serial) on the portal *first*, then come back and enter the secret in the
+module settings and pair each scanner in Scanner Manager (see below). Without
+a valid secret and a registered device serial, scan verification will fail
+even if a scanner is physically connected.
 
 Using a separate V5iD integration ID per property also means that logging
-into the V5iD portal under one property's credential only shows that
-property's verifications — keep that in mind if you manage multiple hotels.
+into the V5iD portal under one property's secret only shows that property's
+verifications — keep that in mind if you manage multiple hotels.
 
 ## Installation
 
@@ -39,39 +44,49 @@ property's verifications — keep that in mind if you manage multiple hotels.
 
 Go to **Modules > Module Manager > V5iD Front Desk > Configure**.
 
-1. **Property** — pick which hotel you're configuring. Credentials are
-   per-property, so repeat this configuration for every hotel that uses
-   V5iD.
-2. **V5id API credentials for this property**
-   - **API base URL** — defaults to `https://api.v5id.net/api/v1`.
-   - **V5id serial number** and **V5id secret** — the credential you
-     generated for this property on [portal.v5id.net](https://portal.v5id.net/).
-   - Click **Test connection** to confirm the credential is valid before
-     relying on it.
-3. **Scanner protocols — all properties** — a system-wide allow-list of
+1. **V5id API — system-wide** — a single **API base URL** for the whole
+   installation (defaults to `https://api.v5id.net/api/v1`), not specific to
+   any one property.
+2. **Property** — pick which hotel you're configuring. The secret below is
+   per-property, so repeat this step for every hotel that uses V5iD.
+3. **V5id secret for this property** — enter the secret you generated for
+   this property on [portal.v5id.net](https://portal.v5id.net/). To **Test
+   connection**, also enter the serial number of any device already
+   registered on the portal for this property (e.g. one already paired in
+   Scanner Manager) — the API requires a serial on every request, so this
+   field exists purely to give the test something to authenticate as. It's
+   never saved.
+4. **Scanner protocols — all properties** — a system-wide allow-list of
    scanner adapters (e.g. Inateck Bluetooth, MagTek HID). Turning one on
    here doesn't connect anything by itself; it just makes that protocol
-   available for pairing in Scanner Manager. Plain keyboard-wedge
-   barcode/MRZ scanners need nothing enabled here — they work
-   automatically.
+   available for pairing in Scanner Manager, which is where a real device
+   serial comes from — see the pairing section below for why that matters.
 
 ## Pairing a physical scanner
 
-Physical scanner pairing is separate from the portal credential above, and
-is done per property from the **V5iD Scanner Manager** tab (open it from the
-**Front Desk** board):
+Pairing is done per property from the **V5iD Scanner Manager** tab (open it
+from the **Front Desk** board), and is where this module gets the serial
+number it needs to validate that device's scans against the V5iD API — make
+sure the same serial is already registered for this property on
+[portal.v5id.net](https://portal.v5id.net/) before pairing it here.
 
 1. Open the Front Desk board for the property and click **Open Scanner
    Manager**. Keep that tab open for the shift — it holds the live
-   connection to the scanner(s) and forwards every scan to your Front Desk
-   tabs.
-2. If the scanner uses one of the enabled protocols (e.g. Bluetooth GATT),
-   pair it from the Scanner Manager page. Once paired, that unit is
-   remembered for this property and reconnects automatically next time.
-3. Plain USB/Bluetooth-HID barcode or MRZ scanners that just type keystrokes
-   need no pairing step — the Front Desk board listens for them directly.
+   connection to the scanner(s) and forwards every scan (and its serial) to
+   your Front Desk tabs.
+2. Pick the scanner's protocol (e.g. Bluetooth GATT) and connect it — the
+   adapter reads the physical unit's serial number directly from the device.
+   Once paired, that unit is remembered for this property and reconnects
+   automatically next time.
 
 A scanner paired at one property is never visible or usable at another.
+
+> **Plain USB/Bluetooth-HID barcode or MRZ scanners** that just type
+> keystrokes have no pairing step and no serial the browser can read, so
+> their scans currently have no device identity to authenticate with — the
+> board reports a clean "no known device" error for them rather than
+> validating against the API. Use a scanner from an enabled protocol above
+> (paired in Scanner Manager) if you need working ID scan verification.
 
 ## Using the Front Desk board
 
@@ -81,11 +96,11 @@ A scanner paired at one property is never visible or usable at another.
 - **Check-in / check-out** — update booking/room status.
 - **Room swap** — move a guest from one room to another.
 - **ID scan verification** — scan a guest's ID; the module sends it to the
-  V5iD API (using the property's credential) and shows the verification
-  result inline.
+  V5iD API (using the property's secret) and shows the verification result
+  inline.
 
 ## Data retention
 
 The module keeps its own scan and activity logs (`v5idfrontdesk_scan_log`,
 `v5idfrontdesk_activity_log`). Uninstalling the module deletes these logs
-along with paired scanner devices and stored credentials.
+along with paired scanner devices and stored secrets.

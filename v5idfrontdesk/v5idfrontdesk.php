@@ -38,12 +38,24 @@ class V5idFrontDesk extends Module
     const CONTROLLER_CLASS = 'AdminV5idFrontDesk';
 
     /**
-     * Bump whenever createTables() gains a new table, so
-     * ensureTablesUpToDate() knows an existing install needs another pass.
+     * Bump whenever createTables() gains a new table (or an existing one
+     * needs a follow-up migration), so ensureTablesUpToDate() knows an
+     * existing install needs another pass.
      * 1 = scan_log/activity_log/scanner_device, 2 = + hotel_credential
-     * (V5id API credentials moved from one global set to one per hotel).
+     * (V5id API credentials moved from one global set to one per hotel),
+     * 3 = hotel_credential drops api_base_url/device_serial (API base URL
+     * became a single system-wide setting — see
+     * dropObsoleteCredentialColumns()), 4 = scanner_device gains its own
+     * token cache columns (access_token etc.) — the V5id API actually
+     * requires a device serial on every token request and rejects one
+     * with none ("Device is not registered"), so a token is issued and
+     * cached per physical device/serial, not per property (see
+     * V5idApiClient and addScannerDeviceTokenColumns()), 5 =
+     * hotel_credential drops its now-redundant access_token/refresh_token/
+     * token_expires_at/refresh_expires_at columns, superseded by the
+     * per-device cache added in 4 (see dropObsoleteCredentialColumns()).
      */
-    const SCHEMA_VERSION = 2;
+    const SCHEMA_VERSION = 5;
 
     /**
      * Known scanner protocol adapters. Each one needing an explicit pairing
@@ -176,6 +188,10 @@ class V5idFrontDesk extends Module
                 `serial` VARCHAR(64) NOT NULL,
                 `label` VARCHAR(64) NOT NULL,
                 `active` TINYINT(1) NOT NULL DEFAULT 1,
+                `access_token` TEXT NULL,
+                `refresh_token` TEXT NULL,
+                `token_expires_at` INT UNSIGNED NULL,
+                `refresh_expires_at` INT UNSIGNED NULL,
                 `date_add` DATETIME NOT NULL,
                 `date_upd` DATETIME NOT NULL,
                 PRIMARY KEY (`id`),
@@ -186,13 +202,7 @@ class V5idFrontDesk extends Module
             'CREATE TABLE IF NOT EXISTS `'._DB_PREFIX_.'v5idfrontdesk_hotel_credential` (
                 `id` INT UNSIGNED NOT NULL AUTO_INCREMENT,
                 `id_hotel` INT UNSIGNED NOT NULL,
-                `api_base_url` VARCHAR(255) NULL,
-                `device_serial` VARCHAR(128) NULL,
                 `device_secret` VARCHAR(255) NULL,
-                `access_token` TEXT NULL,
-                `refresh_token` TEXT NULL,
-                `token_expires_at` INT UNSIGNED NULL,
-                `refresh_expires_at` INT UNSIGNED NULL,
                 `date_add` DATETIME NOT NULL,
                 `date_upd` DATETIME NOT NULL,
                 PRIMARY KEY (`id`),
@@ -235,16 +245,18 @@ class V5idFrontDesk extends Module
     }
 
     /**
-     * Self-heals table schema for installs that predate a newer table —
-     * createTables() is idempotent (CREATE TABLE IF NOT EXISTS for each),
-     * so safe to call again on an existing install. Gated by a version
-     * counter rather than a one-shot boolean flag: a plain "tables are
-     * ready" flag would never run again once set, even after a later
-     * change added yet another new table (exactly what happened between
-     * v5idfrontdesk_scanner_device and v5idfrontdesk_hotel_credential —
-     * bump SCHEMA_VERSION whenever createTables() gains a new table, and
-     * every install below that number picks up the difference on its next
-     * page load. See AdminV5idFrontDeskController::setMedia() for the call site.
+     * Self-heals table schema for installs that predate a newer table, or
+     * a later column migration on an existing table (see
+     * dropObsoleteCredentialColumns()) — createTables() is idempotent
+     * (CREATE TABLE IF NOT EXISTS for each), so safe to call again on an
+     * existing install. Gated by a version counter rather than a one-shot
+     * boolean flag: a plain "tables are ready" flag would never run again
+     * once set, even after a later change added yet another new table
+     * (exactly what happened between v5idfrontdesk_scanner_device and
+     * v5idfrontdesk_hotel_credential) or altered an existing one — bump
+     * SCHEMA_VERSION whenever that happens, and every install below that
+     * number picks up the difference on its next page load. See
+     * AdminV5idFrontDeskController::setMedia() for the call site.
      *
      * @return void
      */
@@ -254,23 +266,108 @@ class V5idFrontDesk extends Module
             return;
         }
 
-        if ($this->createTables()) {
+        if ($this->createTables() && $this->dropObsoleteCredentialColumns() && $this->addScannerDeviceTokenColumns()) {
             Configuration::updateValue('V5IDFRONTDESK_SCHEMA_VERSION', self::SCHEMA_VERSION);
         }
     }
 
     /**
+     * Drops columns from `v5idfrontdesk_hotel_credential` that later
+     * became obsolete: `api_base_url`/`device_serial` (the API base URL
+     * became a single system-wide setting, and the device serial moved to
+     * being supplied per scan rather than stored per property), and
+     * `access_token`/`refresh_token`/`token_expires_at`/
+     * `refresh_expires_at` (the V5id token cache moved onto the matching
+     * V5idFrontDeskScannerDevice row once it turned out a token is issued
+     * per device, not per property) — see V5idFrontDeskHotelCredential's
+     * docblock. A no-op wherever createTables() just created the table
+     * fresh (those columns were never in it to begin with) or this has
+     * already run.
+     *
+     * @return bool
+     */
+    private function dropObsoleteCredentialColumns()
+    {
+        $columns = array(
+            'api_base_url', 'device_serial',
+            'access_token', 'refresh_token', 'token_expires_at', 'refresh_expires_at',
+        );
+
+        foreach ($columns as $column) {
+            // A plain SELECT against information_schema rather than SHOW
+            // COLUMNS ... LIKE: Db::getValue() always appends " LIMIT 1" to
+            // whatever SQL it's given, and MySQL's SHOW COLUMNS syntax
+            // doesn't accept a LIMIT clause at all — that combination is a
+            // syntax error, not just redundant.
+            $exists = Db::getInstance()->getValue(
+                'SELECT COUNT(*) FROM information_schema.COLUMNS
+                WHERE TABLE_SCHEMA = DATABASE()
+                    AND TABLE_NAME = "'._DB_PREFIX_.'v5idfrontdesk_hotel_credential"
+                    AND COLUMN_NAME = "'.pSQL($column).'"'
+            );
+            if ($exists && !Db::getInstance()->execute(
+                'ALTER TABLE `'._DB_PREFIX_.'v5idfrontdesk_hotel_credential` DROP COLUMN `'.bqSQL($column).'`'
+            )) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * Adds the V5id device token cache columns (access_token etc.) to
+     * `v5idfrontdesk_scanner_device` on installs that predate a token
+     * being cached per physical device — see V5idApiClient's docblock for
+     * why (the V5id API requires a device serial on every token request).
+     * A no-op wherever createTables() just created the table fresh (those
+     * columns are already in it) or this has already run.
+     *
+     * @return bool
+     */
+    private function addScannerDeviceTokenColumns()
+    {
+        $columns = array(
+            'access_token' => 'TEXT NULL',
+            'refresh_token' => 'TEXT NULL',
+            'token_expires_at' => 'INT UNSIGNED NULL',
+            'refresh_expires_at' => 'INT UNSIGNED NULL',
+        );
+
+        foreach ($columns as $column => $definition) {
+            $exists = Db::getInstance()->getValue(
+                'SELECT COUNT(*) FROM information_schema.COLUMNS
+                WHERE TABLE_SCHEMA = DATABASE()
+                    AND TABLE_NAME = "'._DB_PREFIX_.'v5idfrontdesk_scanner_device"
+                    AND COLUMN_NAME = "'.pSQL($column).'"'
+            );
+            if (!$exists && !Db::getInstance()->execute(
+                'ALTER TABLE `'._DB_PREFIX_.'v5idfrontdesk_scanner_device` ADD COLUMN `'.bqSQL($column).'` '.$definition
+            )) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /**
      * One-time migration for installs that had a single global V5id
-     * credential before it became per-hotel: copies it into a starting row
-     * for every hotel that doesn't already have its own, so existing scan
-     * validation doesn't just stop working the moment this ships. An
-     * owner can then replace it with a distinct credential per property —
-     * see V5idFrontDeskHotelCredential's own docblock for why that matters
-     * (it's what makes the V5id portal itself show only one property's
-     * verifications per login). Gated by a config flag, not
-     * SCHEMA_VERSION: this only needs to run once ever, regardless of how
-     * many more tables get added later. See
-     * AdminV5idFrontDeskController::setMedia() for the call site.
+     * credential before it became per-hotel: copies its secret into a
+     * starting row for every hotel that doesn't already have its own, so
+     * existing scan validation doesn't just stop working the moment this
+     * ships. An owner can then replace it with a distinct secret per
+     * property — see V5idFrontDeskHotelCredential's own docblock for why
+     * that matters (it's what makes the V5id portal itself show only one
+     * property's verifications per login). The old global serial number
+     * has no per-hotel equivalent to migrate into — a serial now belongs
+     * to a specific paired scanner (see V5idFrontDeskScannerDevice), not
+     * a property as a whole — so it's simply left behind; existing
+     * scanners will need pairing in Scanner Manager regardless. Gated by
+     * a config flag, not SCHEMA_VERSION: this only needs to run once
+     * ever, regardless of how many more tables get added later. See
+     * AdminV5idFrontDeskController::setMedia() for the
+     * call site.
      *
      * @return void
      */
@@ -280,16 +377,14 @@ class V5idFrontDesk extends Module
             return;
         }
 
-        $baseUrl = trim((string) Configuration::get('V5IDFRONTDESK_API_BASE_URL'));
-        $serial = trim((string) Configuration::get('V5IDFRONTDESK_DEVICE_SERIAL'));
         $secret = trim((string) Configuration::get('V5IDFRONTDESK_DEVICE_SECRET'));
 
-        if ($baseUrl && $serial && $secret) {
+        if ($secret) {
             $hotels = Db::getInstance()->executeS('SELECT id FROM `'._DB_PREFIX_.'htl_branch_info`');
             foreach ($hotels ?: array() as $hotel) {
                 $idHotel = (int) $hotel['id'];
                 if (!V5idFrontDeskHotelCredential::getForHotel($idHotel)) {
-                    V5idFrontDeskHotelCredential::saveForHotel($idHotel, $baseUrl, $serial, $secret);
+                    V5idFrontDeskHotelCredential::saveForHotel($idHotel, $secret);
                 }
             }
         }
@@ -415,15 +510,17 @@ class V5idFrontDesk extends Module
         // of which button was clicked — the more specific button must be
         // checked first.
         if (Tools::isSubmit('submitV5idFrontDeskTestConnection')) {
-            // Save before testing: V5idApiClient reads its base URL/serial/
-            // secret from this hotel's own stored row, not from this
-            // request's POST data, so testing without saving first would
-            // silently re-test whatever was already saved — not whatever
-            // was just typed into the form.
+            // Save before testing: V5idApiClient reads the system-wide base
+            // URL and this hotel's own stored secret, not this request's
+            // POST data, so testing without saving first would silently
+            // re-test whatever was already saved — not whatever was just
+            // typed into the form. The test serial itself is never saved —
+            // see the field's own description below.
             $saveResult = $this->processSettingsSubmit($idHotel);
             $output .= $saveResult['html'];
             if ($saveResult['success']) {
-                $output .= $this->processTestConnection($idHotel);
+                $testSerial = trim((string) Tools::getValue('V5IDFRONTDESK_TEST_DEVICE_SERIAL'));
+                $output .= $this->processTestConnection($idHotel, $testSerial);
             }
         } elseif (Tools::isSubmit('submitV5idFrontDeskSettings')) {
             $output .= $this->processSettingsSubmit($idHotel)['html'];
@@ -470,23 +567,27 @@ class V5idFrontDesk extends Module
      */
     private function processSettingsSubmit($idHotel)
     {
+        // The API base URL is a single system-wide setting — saved once
+        // here regardless of which property's form triggered the submit,
+        // never scoped to $idHotel.
         $baseUrl = trim((string) Tools::getValue('V5IDFRONTDESK_API_BASE_URL'));
-        $serial = trim((string) Tools::getValue('V5IDFRONTDESK_DEVICE_SERIAL'));
-        $secret = trim((string) Tools::getValue('V5IDFRONTDESK_DEVICE_SECRET'));
+        if (!$baseUrl || !Validate::isAbsoluteUrl($baseUrl)) {
+            return array('html' => $this->displayError($this->l('Please enter a valid API base URL.')), 'success' => false);
+        }
+        Configuration::updateValue('V5IDFRONTDESK_API_BASE_URL', rtrim($baseUrl, '/'));
 
         if (!$idHotel) {
             return array('html' => $this->displayError($this->l('Select a property first.')), 'success' => false);
         }
 
-        if (!$baseUrl || !Validate::isAbsoluteUrl($baseUrl)) {
-            return array('html' => $this->displayError($this->l('Please enter a valid API base URL.')), 'success' => false);
-        }
+        $secret = trim((string) Tools::getValue('V5IDFRONTDESK_DEVICE_SECRET'));
 
-        // saveForHotel() only touches the cached token (clearing it) when a
-        // genuinely new secret is passed — an empty string here means
-        // "leave the currently saved secret alone", same as before.
-        if (!V5idFrontDeskHotelCredential::saveForHotel($idHotel, $baseUrl, $serial, $secret)) {
-            return array('html' => $this->displayError($this->l('Could not save these credentials. Please try again.')), 'success' => false);
+        // saveForHotel() only clears this hotel's paired devices' cached
+        // tokens when a genuinely new secret is passed — an empty string
+        // here means "leave the currently saved secret alone", same as
+        // before.
+        if (!V5idFrontDeskHotelCredential::saveForHotel($idHotel, $secret)) {
+            return array('html' => $this->displayError($this->l('Could not save this property\'s secret. Please try again.')), 'success' => false);
         }
 
         $enabledScanners = array();
@@ -502,12 +603,20 @@ class V5idFrontDesk extends Module
 
     /**
      * @param int $idHotel
+     * @param string $serial A device serial to authenticate as for this one-off check — the V5id
+     *                       API requires one on every token request (see V5idApiClient's
+     *                       docblock), so this field exists purely to give "Test Connection"
+     *                       something to send. Never persisted.
      *
      * @return string
      */
-    private function processTestConnection($idHotel)
+    private function processTestConnection($idHotel, $serial)
     {
-        $client = new V5idApiClient($idHotel);
+        if ($serial === '') {
+            return $this->displayError($this->l('Enter a device serial number to test with — the V5id API requires one on every request.'));
+        }
+
+        $client = new V5idApiClient($idHotel, $serial);
         $result = $client->getDeviceToken(true);
 
         if ($result['success']) {
@@ -524,18 +633,14 @@ class V5idFrontDesk extends Module
      */
     private function renderSettingsForm($idHotel)
     {
-        $fieldsForm = array(
+        $apiFieldsForm = array(
             'form' => array(
                 'legend' => array(
-                    'title' => $this->l('V5id API credentials for this property'),
-                    'icon' => 'icon-key',
+                    'title' => $this->l('V5id API — system-wide'),
+                    'icon' => 'icon-globe',
                 ),
-                'description' => $this->l('Each property has its own V5id integration credential — an owner using a separate integration ID per property will only see that property\'s verifications when logging into the V5id portal, and this is what makes that possible. These are exchanged server-side for a short-lived token used to validate scans — never sent to the browser. Physical scanner hardware is a separate concept: it\'s paired per property in that property\'s own Scanner Manager (open it from the Front Desk screen), not here.'),
+                'description' => $this->l('A single setting for the whole installation, not specific to one property: just the endpoint address, so it never varies by hotel.'),
                 'input' => array(
-                    array(
-                        'type' => 'hidden',
-                        'name' => 'id_hotel',
-                    ),
                     array(
                         'type' => 'text',
                         'label' => $this->l('API base URL'),
@@ -543,18 +648,38 @@ class V5idFrontDesk extends Module
                         'desc' => $this->l('e.g. https://api.v5id.net/api/v1'),
                         'required' => true,
                     ),
+                ),
+                'submit' => array(
+                    'title' => $this->l('Save'),
+                    'name' => 'submitV5idFrontDeskSettings',
+                ),
+            ),
+        );
+
+        $fieldsForm = array(
+            'form' => array(
+                'legend' => array(
+                    'title' => $this->l('V5id secret for this property'),
+                    'icon' => 'icon-key',
+                ),
+                'description' => $this->l('Each property has its own V5id integration secret — an owner using a separate integration ID per property will only see that property\'s verifications when logging into the V5id portal, and this is what makes that possible. It\'s exchanged server-side, together with a device serial number, for a short-lived token used to validate scans — never sent to the browser. The token is scoped to that specific device and cached against it (see Scanner Manager), not against this property as a whole. Physical scanner hardware is a separate concept: it\'s paired per property in that property\'s own Scanner Manager (open it from the Front Desk screen), not here.'),
+                'input' => array(
                     array(
-                        'type' => 'text',
-                        'label' => $this->l('V5id serial number'),
-                        'name' => 'V5IDFRONTDESK_DEVICE_SERIAL',
-                        'desc' => $this->l('This property\'s API credential from the V5id portal — not a physical scanner\'s serial number (those are paired per property in Scanner Manager).'),
-                        'required' => true,
+                        'type' => 'hidden',
+                        'name' => 'id_hotel',
                     ),
                     array(
                         'type' => 'password',
                         'label' => $this->l('V5id secret'),
                         'name' => 'V5IDFRONTDESK_DEVICE_SECRET',
                         'desc' => $this->l('Leave blank to keep this property\'s currently saved secret.'),
+                        'required' => false,
+                    ),
+                    array(
+                        'type' => 'text',
+                        'label' => $this->l('Device serial (for testing)'),
+                        'name' => 'V5IDFRONTDESK_TEST_DEVICE_SERIAL',
+                        'desc' => $this->l('Only used by "Test connection" below, never saved. The V5id API requires a registered device serial on every request — enter one already registered on the V5id portal for a device under this property (e.g. one already paired in Scanner Manager).'),
                         'required' => false,
                     ),
                 ),
@@ -580,7 +705,7 @@ class V5idFrontDesk extends Module
                     'title' => $this->l('Scanner protocols — all properties'),
                     'icon' => 'icon-barcode',
                 ),
-                'description' => $this->l('A system-wide allow-list, not specific to one property: turn on the scanner protocols available anywhere in this installation. Each one is a self-contained adapter, so a new scanner brand can be added later without changing the front desk screen itself. Enabling a protocol here doesn\'t connect anything by itself — each property still pairs its own specific scanner(s) separately, in that property\'s own Scanner Manager (open it from the Front Desk screen). Scanners that just type plain keystrokes (most USB/Bluetooth-HID barcode scanners) need nothing enabled here at all — they work automatically.'),
+                'description' => $this->l('A system-wide allow-list, not specific to one property: turn on the scanner protocols available anywhere in this installation. Each one is a self-contained adapter, so a new scanner brand can be added later without changing the front desk screen itself. Enabling a protocol here doesn\'t connect anything by itself — each property still pairs its own specific scanner(s) separately, in that property\'s own Scanner Manager (open it from the Front Desk screen). Pairing is also where V5id scan verification gets the device serial number it requires — a scanner that just types plain keystrokes (most USB/Bluetooth-HID barcode scanners) has no pairing step and no serial the browser can read, so its scans currently can\'t be verified against V5id.'),
                 'input' => array(
                     array(
                         'type' => 'checkbox',
@@ -615,7 +740,7 @@ class V5idFrontDesk extends Module
             'id_language' => $this->context->language->id,
         );
 
-        return $this->renderHotelPicker($idHotel).$helper->generateForm(array($fieldsForm, $scannerFieldsForm));
+        return $this->renderHotelPicker($idHotel).$helper->generateForm(array($apiFieldsForm, $fieldsForm, $scannerFieldsForm));
     }
 
     /**
@@ -683,22 +808,17 @@ class V5idFrontDesk extends Module
      */
     private function getConfigFieldsValues($idHotel)
     {
-        $credential = V5idFrontDeskHotelCredential::getForHotel($idHotel);
-
         $fields = array(
             'id_hotel' => (int) $idHotel,
             'V5IDFRONTDESK_API_BASE_URL' => Tools::getValue(
                 'V5IDFRONTDESK_API_BASE_URL',
-                // A hotel with nothing configured yet falls back to the old
-                // installation-wide default, purely to pre-fill a sensible
-                // starting URL — not read at scan-validation time anymore.
-                $credential ? $credential->api_base_url : Configuration::get('V5IDFRONTDESK_API_BASE_URL')
-            ),
-            'V5IDFRONTDESK_DEVICE_SERIAL' => Tools::getValue(
-                'V5IDFRONTDESK_DEVICE_SERIAL',
-                $credential ? $credential->device_serial : ''
+                Configuration::get('V5IDFRONTDESK_API_BASE_URL')
             ),
             'V5IDFRONTDESK_DEVICE_SECRET' => '',
+            // Round-trips whatever was just typed (e.g. after a failed Test
+            // Connection) — never read from anywhere persistent, since this
+            // field itself is never saved.
+            'V5IDFRONTDESK_TEST_DEVICE_SERIAL' => Tools::getValue('V5IDFRONTDESK_TEST_DEVICE_SERIAL', ''),
         );
 
         $enabledScanners = self::getEnabledScannerAdapters();

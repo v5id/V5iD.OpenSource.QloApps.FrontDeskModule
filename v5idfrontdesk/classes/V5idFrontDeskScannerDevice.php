@@ -10,6 +10,14 @@
  * property must never see or be able to use a scanner registered to another
  * — see getForHotel().
  *
+ * This row also doubles as the V5id device token cache (access_token etc.)
+ * for this exact physical unit: the V5id API issues a token per device
+ * serial, not per property, and rejects a request that doesn't carry one
+ * ("Device is not registered") — see V5idApiClient. A serial with no
+ * matching row here (e.g. one typed into the settings page's "Test
+ * Connection" field) still works against the API, it just has nothing to
+ * cache the resulting token onto.
+ *
  * Copyright (C) 2026  V5iD, Inc.
  *
  * This program is free software: you can redistribute it and/or modify
@@ -37,6 +45,10 @@ class V5idFrontDeskScannerDevice extends ObjectModel
     public $serial;
     public $label;
     public $active;
+    public $access_token;
+    public $refresh_token;
+    public $token_expires_at;
+    public $refresh_expires_at;
     public $date_add;
     public $date_upd;
 
@@ -49,6 +61,10 @@ class V5idFrontDeskScannerDevice extends ObjectModel
             'serial' => array('type' => self::TYPE_STRING, 'validate' => 'isGenericName', 'required' => true, 'size' => 64),
             'label' => array('type' => self::TYPE_STRING, 'validate' => 'isGenericName', 'required' => true, 'size' => 64),
             'active' => array('type' => self::TYPE_BOOL, 'validate' => 'isBool'),
+            'access_token' => array('type' => self::TYPE_STRING),
+            'refresh_token' => array('type' => self::TYPE_STRING),
+            'token_expires_at' => array('type' => self::TYPE_INT, 'validate' => 'isUnsignedInt'),
+            'refresh_expires_at' => array('type' => self::TYPE_INT, 'validate' => 'isUnsignedInt'),
             'date_add' => array('type' => self::TYPE_DATE, 'validate' => 'isDate'),
             'date_upd' => array('type' => self::TYPE_DATE, 'validate' => 'isDate'),
         ),
@@ -105,6 +121,64 @@ class V5idFrontDeskScannerDevice extends ObjectModel
         $device = new self($idDevice);
 
         return Validate::isLoadedObject($device) ? $device : null;
+    }
+
+    /**
+     * Finds the row for a specific physical unit at a specific hotel by
+     * serial alone, ignoring adapter_id — used for V5id API/token purposes,
+     * where the serial is the only identity V5id itself knows about (our
+     * adapter_id is a purely local bucket for which local pairing code to
+     * use, meaningless to V5id). Scoped by id_hotel for the same reason as
+     * findByHotelAdapterSerial(): the same physical unit paired at two
+     * properties gets two independent rows/token caches.
+     *
+     * @param int $idHotel
+     * @param string $serial
+     *
+     * @return V5idFrontDeskScannerDevice|null
+     */
+    public static function findByHotelSerial($idHotel, $serial)
+    {
+        $idDevice = (int) Db::getInstance()->getValue(
+            'SELECT id
+            FROM `'._DB_PREFIX_.'v5idfrontdesk_scanner_device`
+            WHERE id_hotel = '.(int) $idHotel.'
+                AND serial = "'.pSQL($serial).'"'
+        );
+
+        if (!$idDevice) {
+            return null;
+        }
+
+        $device = new self($idDevice);
+
+        return Validate::isLoadedObject($device) ? $device : null;
+    }
+
+    /**
+     * Persists a freshly issued/refreshed V5id device token pair onto this
+     * row — see V5idApiClient, which reads it back as this device's cached
+     * token.
+     *
+     * @param array $tokenResponse Decoded TokenResponse body from the V5id API.
+     *
+     * @return bool
+     */
+    public function storeTokenPair(array $tokenResponse)
+    {
+        $expiresIn = isset($tokenResponse['expires_in']) ? (int) $tokenResponse['expires_in'] : 0;
+
+        $this->access_token = isset($tokenResponse['access_token']) ? $tokenResponse['access_token'] : null;
+        $this->token_expires_at = time() + $expiresIn;
+
+        if (!empty($tokenResponse['refresh_token'])) {
+            $this->refresh_token = $tokenResponse['refresh_token'];
+            $this->refresh_expires_at = time() + (7 * 86400);
+        }
+
+        $this->date_upd = date('Y-m-d H:i:s');
+
+        return (bool) $this->update();
     }
 
     /**

@@ -644,7 +644,14 @@ class AdminV5idFrontDeskController extends ModuleAdminController
             $this->dieError($this->l('Empty scan.'));
         }
 
-        $client = new V5idApiClient($idHotel);
+        // Set only for scans relayed from a Scanner Manager-paired device
+        // (see frontdesk-app.js) — the V5id API requires a device serial on
+        // every token request, so a plain keyboard-wedge scan (no paired
+        // device, no serial) fails cleanly inside V5idApiClient rather than
+        // reaching the API with a request it's guaranteed to reject.
+        $serial = trim((string) Tools::getValue('device_serial'));
+
+        $client = new V5idApiClient($idHotel, $serial);
         $result = $client->validateScan($raw);
 
         $matches = $result['valid'] ? V5idFrontDeskGuestLocator::matchScanToBooking($result, $idHotel) : array();

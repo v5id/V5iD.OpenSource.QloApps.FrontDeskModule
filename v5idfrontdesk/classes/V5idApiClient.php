@@ -10,12 +10,20 @@
  *   POST /device/validate
  * The richer /verifications/* flow (document images, face liveness) is out of scope.
  *
- * One client is scoped to one hotel: base URL, device serial/secret and the
- * cached token pair all come from that hotel's own
- * V5idFrontDeskHotelCredential row, never a shared/global credential — see
- * that class's docblock for why (an owner using a separate V5id
- * integration ID per property expects the V5id portal itself to only show
- * that property's verifications, which a shared credential would defeat).
+ * A client is scoped to one hotel and, for anything that talks to V5id,
+ * one physical device's serial number: the V5id API rejects a token
+ * request carrying no serial ("Device is not registered"), so a serial is
+ * mandatory — see issueDeviceToken(). The device secret comes from that
+ * hotel's own V5idFrontDeskHotelCredential row, never a shared/global
+ * credential (an owner using a separate V5id integration ID per property
+ * expects the V5id portal itself to only show that property's
+ * verifications, which a shared credential would defeat). The token
+ * itself is cached on whichever V5idFrontDeskScannerDevice row matches
+ * (id_hotel, serial), if any — a serial with no such row (e.g. one typed
+ * into "Test Connection" for a one-off check) still authenticates fine,
+ * it's just never cached. The API base URL is a single system-wide
+ * setting (V5IDFRONTDESK_API_BASE_URL) — just an endpoint address, not a
+ * per-property credential, so it never varies by hotel.
  *
  * Copyright (C) 2026  V5iD, Inc.
  *
@@ -45,8 +53,14 @@ class V5idApiClient
     /** @var int */
     private $idHotel;
 
-    /** @var V5idFrontDeskHotelCredential|null Null when this hotel has no credential configured yet. */
+    /** @var string Physical device serial this client authenticates as. May be '' when no scan/test supplied one. */
+    private $serial;
+
+    /** @var V5idFrontDeskHotelCredential|null Null when this hotel has no secret configured yet. */
     private $credential;
+
+    /** @var V5idFrontDeskScannerDevice|null The paired device row backing $serial, if one exists — used as the token cache. */
+    private $device;
 
     /** @var string */
     private $baseUrl;
@@ -56,12 +70,18 @@ class V5idApiClient
 
     /**
      * @param int $idHotel
+     * @param string $serial The physical scanner's serial number — required by the V5id API for
+     *                       every token request. Pass '' only when no device identity is available
+     *                       yet (getDeviceToken()/validateScan() will fail cleanly rather than call
+     *                       the API with a request it's guaranteed to reject).
      */
-    public function __construct($idHotel)
+    public function __construct($idHotel, $serial = '')
     {
         $this->idHotel = (int) $idHotel;
+        $this->serial = trim((string) $serial);
         $this->credential = V5idFrontDeskHotelCredential::getForHotel($this->idHotel);
-        $this->baseUrl = $this->credential ? rtrim((string) $this->credential->api_base_url, '/') : '';
+        $this->device = $this->serial !== '' ? V5idFrontDeskScannerDevice::findByHotelSerial($this->idHotel, $this->serial) : null;
+        $this->baseUrl = rtrim((string) Configuration::get('V5IDFRONTDESK_API_BASE_URL'), '/');
         $this->moduleInstance = Module::getInstanceByName('v5idfrontdesk');
     }
 
@@ -69,21 +89,29 @@ class V5idApiClient
      * Ensures a valid device access token is cached and returns it.
      *
      * @param bool $forceReauth When true, ignores any cached token and re-authenticates
-     *                          from the stored serial/secret (used by "Test connection").
+     *                          from the stored secret (used by "Test connection").
      *
      * @return array{success: bool, access_token: ?string, message: string}
      */
     public function getDeviceToken($forceReauth = false)
     {
-        if (!$this->credential) {
+        if (!$this->credential || !$this->credential->device_secret) {
             return array(
                 'success' => false,
                 'access_token' => null,
-                'message' => $this->l('No V5id credential is configured for this property yet. Set one up under Front Desk settings.'),
+                'message' => $this->l('No V5id secret is configured for this property yet. Set one up under Front Desk settings.'),
             );
         }
 
-        if (!$forceReauth) {
+        if ($this->serial === '') {
+            return array(
+                'success' => false,
+                'access_token' => null,
+                'message' => $this->l('This scan didn\'t come from a device with a known serial number. Pair the scanner in Scanner Manager first.'),
+            );
+        }
+
+        if (!$forceReauth && $this->device) {
             $cached = $this->getCachedAccessToken();
             if ($cached !== null) {
                 return array('success' => true, 'access_token' => $cached, 'message' => '');
@@ -165,8 +193,8 @@ class V5idApiClient
      */
     private function getCachedAccessToken()
     {
-        $token = $this->credential->access_token;
-        $expiresAt = (int) $this->credential->token_expires_at;
+        $token = $this->device->access_token;
+        $expiresAt = (int) $this->device->token_expires_at;
 
         if ($token && $expiresAt > (time() + self::TOKEN_EXPIRY_BUFFER)) {
             return $token;
@@ -180,8 +208,8 @@ class V5idApiClient
      */
     private function refreshDeviceToken()
     {
-        $refreshToken = $this->credential->refresh_token;
-        $refreshExpiresAt = (int) $this->credential->refresh_expires_at;
+        $refreshToken = $this->device->refresh_token;
+        $refreshExpiresAt = (int) $this->device->refresh_expires_at;
 
         if (!$refreshToken || $refreshExpiresAt <= time()) {
             return array('success' => false, 'access_token' => null, 'message' => $this->l('No usable refresh token cached.'));
@@ -198,7 +226,7 @@ class V5idApiClient
             return array('success' => false, 'access_token' => null, 'message' => $this->extractErrorMessage($response));
         }
 
-        $this->credential->storeTokenPair($response['body']);
+        $this->device->storeTokenPair($response['body']);
 
         return array('success' => true, 'access_token' => $response['body']['access_token'], 'message' => '');
     }
@@ -208,24 +236,30 @@ class V5idApiClient
      */
     private function issueDeviceToken()
     {
-        $serial = $this->credential->device_serial;
         $secret = $this->credential->device_secret;
 
-        if (!$serial || !$secret) {
-            return array('success' => false, 'access_token' => null, 'message' => $this->l('This property\'s V5id serial number and secret are not fully configured.'));
-        }
-
+        // The V5id API requires both fields — a request with no
+        // serialNumber is rejected outright ("Device is not registered"),
+        // confirming a token is issued (and scoped) per device, not per
+        // property. $this->serial has already been checked non-empty by
+        // getDeviceToken() before this is ever called.
         $response = $this->request(
             'POST',
             '/security/device/token',
-            array('serialNumber' => $serial, 'secret' => $secret)
+            array('serialNumber' => $this->serial, 'secret' => $secret)
         );
 
         if ($response['http_code'] !== 200 || $response['body'] === null) {
             return array('success' => false, 'access_token' => null, 'message' => $this->extractErrorMessage($response));
         }
 
-        $this->credential->storeTokenPair($response['body']);
+        // Only a serial with a matching paired-device row has anywhere to
+        // cache the token — see this class's docblock. A "Test Connection"
+        // serial that isn't paired to anything still authenticates fine,
+        // it's just re-issued every time rather than cached.
+        if ($this->device) {
+            $this->device->storeTokenPair($response['body']);
+        }
 
         return array('success' => true, 'access_token' => $response['body']['access_token'], 'message' => '');
     }

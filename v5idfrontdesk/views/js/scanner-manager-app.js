@@ -160,7 +160,11 @@
             instance = protocol.createInstance();
             instance.connect({
                 onScan: function (raw) {
-                    channel.send('scan', { deviceId: device.id, adapterId: device.adapter_id, data: raw });
+                    // serial travels with the scan (not just deviceId/adapterId)
+                    // because the Front Desk board forwards it straight through
+                    // to V5id's own scan-validation API, which requires a
+                    // registered device serial on every request.
+                    channel.send('scan', { deviceId: device.id, adapterId: device.adapter_id, serial: device.serial, data: raw });
                     // Confirms a scan came through without echoing any of its
                     // decoded content (name, DOB, document number, ...) to
                     // the screen — this tab is for pairing/monitoring
