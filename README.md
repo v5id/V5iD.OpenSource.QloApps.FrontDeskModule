@@ -29,7 +29,7 @@ property's verifications — keep that in mind if you manage multiple hotels.
 1. Get the module as a zip file — either zip up this repo yourself, or
    download a zip from the GitHub release. The zip must contain a single
    top-level `v5idfrontdesk` folder (with `v5idfrontdesk.php` etc. inside
-   it), not the files loose at the zip root.
+   it).
 2. In the back office, go to **Modules > Module Manager** and click **Add a
    new module**.
 3. Select the zip file and click **Upload and install this module**.
