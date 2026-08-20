@@ -2,7 +2,7 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>{l s='V5iD Scanner Manager' mod='v5idfrontdesk'}</title>
+<title>{if $hotelName}{l s='V5iD Scanner Manager' mod='v5idfrontdesk'} — {$hotelName|escape:'html':'UTF-8'}{else}{l s='V5iD Scanner Manager' mod='v5idfrontdesk'}{/if}</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <link rel="stylesheet" href="{$cssUrl}">
 </head>
@@ -10,6 +10,7 @@
 <div class="v5sm-shell">
 	<header class="v5sm-header">
 		<h1>{l s='V5iD Scanner Manager' mod='v5idfrontdesk'}</h1>
+		{if $hotelName}<p class="v5sm-hotel">{$hotelName|escape:'html':'UTF-8'}</p>{/if}
 		<p class="v5sm-hint">{l s='Keep this tab open for the shift. It holds the connection to your scanner(s) and forwards every scan to your Front Desk tabs, even while you navigate around in them.' mod='v5idfrontdesk'}</p>
 	</header>
 

@@ -39,6 +39,13 @@ body {
     margin: 0 0 8px;
 }
 
+.v5sm-hotel {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--v5sm-primary);
+    margin: 0 0 8px;
+}
+
 .v5sm-hint {
     font-size: 13px;
     color: var(--v5sm-muted);

@@ -177,6 +177,9 @@ class AdminV5idFrontDeskController extends ModuleAdminController
             die($this->l('You do not have access to this hotel.'));
         }
 
+        $hotel = (new HotelBranchInformation())->hotelBranchesInfo(false, 2, 0, $idHotel);
+        $hotelName = $hotel && !empty($hotel['hotel_name']) ? $hotel['hotel_name'] : '';
+
         $enabledAdapters = V5idFrontDesk::getEnabledScannerAdapters();
 
         $adapterJsUrls = array();
@@ -190,6 +193,7 @@ class AdminV5idFrontDeskController extends ModuleAdminController
             'adapterJsUrls' => $adapterJsUrls,
             'channelJsUrl' => $this->assetUrl('views/js/scanner-channel.js'),
             'managerAppJsUrl' => $this->assetUrl('views/js/scanner-manager-app.js'),
+            'hotelName' => $hotelName,
             // Read by scanner-manager-app.js as window.v5idScannerManagerConfig
             // — every device list/save/delete call it makes is scoped to
             // this hotel, both here (what it asks for) and server-side
