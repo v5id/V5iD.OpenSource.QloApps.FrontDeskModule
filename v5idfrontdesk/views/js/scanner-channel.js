@@ -10,41 +10,36 @@
  * receive a scan, status, or "is a manager open" signal that actually came
  * from Property B's Scanner Manager tab, even when both happen to be open
  * in the same browser at once (a real scenario for anyone administering
- * more than one property). A single shared channel name/heartbeat key
+ * more than one property). A single shared channel name
  * would leak exactly that — handleScan() has no way to know a received
  * scan came from a different property's device, and would validate it
  * against whatever hotel the board tab currently has selected.
  *
- * Two mechanisms per channel, both same-origin/same-browser only:
+ * One mechanism per channel, same-origin/same-browser only: BroadcastChannel
+ * carries the events (scan/status/error), tagged with the id of the adapter
+ * that produced them (see scanners/registry.js) so a board tab can tell which
+ * physical scanner a message came from. It also carries a 'ping' with no
+ * payload, which board tabs send on a short interval; the Scanner Manager
+ * answers with 'pong' plus one 'status' per device.
  *
- * - BroadcastChannel carries the actual events (scan/status/error), tagged
- *   with the id of the adapter that produced them (see scanners/registry.js)
- *   so a board tab can tell which physical scanner a message came from. It
- *   also carries a 'query-status' request with no payload, which a board tab
- *   sends right after it (re)mounts so the manager can reply with a 'status'
- *   message per device — otherwise a tab that starts listening only after a
- *   status change already happened would never learn about it.
- * - A localStorage timestamp, refreshed every HEARTBEAT_INTERVAL_MS by the
- *   Scanner Manager tab, lets board tabs answer "is a manager tab even open
- *   right now, for this hotel?" without needing a live BroadcastChannel
- *   round trip — useful for showing an "Open Scanner Manager" prompt before
- *   any adapter has reported status.
+ * That round trip, rather than a timestamp the Scanner Manager refreshes on a
+ * timer, is what tells a board tab whether a manager is open at all. Chrome
+ * throttles a hidden page's timers to roughly one wake-up per minute once it
+ * has been in the background for five minutes — exactly the deployment this
+ * module asks for — but it does not throttle message delivery, so a liveness
+ * signal built on a timer in that tab would read as dead for most of every
+ * minute while scans kept arriving normally.
  */
 (function (window) {
     'use strict';
 
     var CHANNEL_NAME_PREFIX = 'v5idfrontdesk_scanner_v1_';
-    var HEARTBEAT_KEY_PREFIX = 'v5idfrontdesk_scanner_manager_heartbeat_';
-    var HEARTBEAT_INTERVAL_MS = 2000;
-    var HEARTBEAT_STALE_MS = 5000;
 
     /** @param {number|string} idHotel */
     function createChannel(idHotel) {
         var channelName = CHANNEL_NAME_PREFIX + idHotel;
-        var heartbeatKey = HEARTBEAT_KEY_PREFIX + idHotel;
         var channel = ('BroadcastChannel' in window) ? new BroadcastChannel(channelName) : null;
         var handlers = {};
-        var heartbeatTimer = null;
 
         if (channel) {
             channel.onmessage = function (event) {
@@ -66,8 +61,8 @@
             },
 
             /**
-             * @param {string} type 'scan' | 'status' | 'error'
-             * @param {object} payload
+             * @param {string} type 'scan' | 'status' | 'error' | 'ping' | 'pong'
+             * @param {object} [payload]
              */
             send: function (type, payload) {
                 if (!channel) {
@@ -87,42 +82,6 @@
             close: function () {
                 if (channel) {
                     channel.close();
-                }
-                this.stopHeartbeat();
-            },
-
-            /** Scanner Manager tab only: marks it alive for isManagerAlive(). */
-            startHeartbeat: function () {
-                var beat = function () {
-                    try {
-                        window.localStorage.setItem(heartbeatKey, String(Date.now()));
-                    } catch (e) {
-                        /* storage unavailable (private browsing, quota) — isManagerAlive() will just read as stale */
-                    }
-                };
-                beat();
-                heartbeatTimer = window.setInterval(beat, HEARTBEAT_INTERVAL_MS);
-            },
-
-            stopHeartbeat: function () {
-                if (heartbeatTimer) {
-                    window.clearInterval(heartbeatTimer);
-                    heartbeatTimer = null;
-                }
-                try {
-                    window.localStorage.removeItem(heartbeatKey);
-                } catch (e) {
-                    /* ignore */
-                }
-            },
-
-            /** Board tabs: is a Scanner Manager tab for this same hotel currently open and alive? */
-            isManagerAlive: function () {
-                try {
-                    var last = parseInt(window.localStorage.getItem(heartbeatKey) || '0', 10);
-                    return (Date.now() - last) < HEARTBEAT_STALE_MS;
-                } catch (e) {
-                    return false;
                 }
             },
         };

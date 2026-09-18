@@ -484,7 +484,25 @@ class V5idFrontDesk extends Module
             return;
         }
 
-        $this->context->controller->addJS($this->_path.'views/js/admin-nav-icon.js');
+        $this->context->controller->addJS($this->assetUri('views/js/admin-nav-icon.js'));
+    }
+
+    /**
+     * Module asset URI with a filemtime-based cache-busting query string, so
+     * browsers pick up JS/CSS changes immediately after a deploy instead of
+     * serving a stale cached copy. Lives here rather than only on
+     * AdminV5idFrontDeskController so assets queued from a hook get it too.
+     *
+     * @param string $relativePath
+     *
+     * @return string
+     */
+    public function assetUri($relativePath)
+    {
+        $localFile = $this->getLocalPath().$relativePath;
+        $version = is_file($localFile) ? filemtime($localFile) : $this->version;
+
+        return $this->_path.$relativePath.'?v='.$version;
     }
 
     /**

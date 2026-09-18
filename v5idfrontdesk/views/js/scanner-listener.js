@@ -22,6 +22,17 @@
  * page should be typed into it, which is why it's 1x1, off-screen and
  * `tabIndex="-1"` (unreachable by Tab, unclickable, never a deliberate
  * target for a person).
+ *
+ * That greed has to stop while someone is navigating by keyboard, or no
+ * button on the page can hold focus long enough to be pressed. Pressing Tab
+ * therefore suspends it until the next pointer press: buttons, links and the
+ * board cells keep focus and Enter reaches them. The cost is that a scan
+ * performed while a button holds focus is lost, because the payload needs a
+ * focused editable element to compose control bytes into and there is nowhere
+ * to put it. Clicking anywhere, or moving into the search field, resumes
+ * scanning — and a scan typed into the search field is recovered by
+ * frontdesk-app.js's runSearch(), which routes an ID payload to handleScan()
+ * instead of the search endpoint.
  */
 (function (window, document) {
     'use strict';
@@ -39,6 +50,7 @@
         var onScan = null;
         var quietTimer = null;
         var burstStartedAt = 0;
+        var keyboardNavigating = false;
 
         function isRealTextField(el) {
             if (!el || el === proxyEl) {
@@ -48,13 +60,31 @@
             return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || el.isContentEditable;
         }
 
+        /** Anything the operator can deliberately focus — not the body, and not this listener's own proxy. */
+        function isFocusableControl(el) {
+            return !!el && el !== proxyEl && el !== document.body && el.tabIndex >= 0;
+        }
+
+        function onDocumentKeydown(evt) {
+            if (evt.key === 'Tab') {
+                keyboardNavigating = true;
+            }
+        }
+
+        function onPointerDown() {
+            keyboardNavigating = false;
+        }
+
         function ensureProxy() {
             if (proxyEl) {
                 return proxyEl;
             }
 
             proxyEl = document.createElement('textarea');
-            proxyEl.setAttribute('aria-hidden', 'true');
+            // Not aria-hidden: this element takes programmatic focus, and
+            // hiding a focusable element from assistive technology is
+            // invalid. A label is the honest alternative.
+            proxyEl.setAttribute('aria-label', 'ID scanner input');
             proxyEl.tabIndex = -1;
             proxyEl.autocomplete = 'off';
             proxyEl.spellcheck = false;
@@ -111,6 +141,9 @@
             if (!proxyEl || isRealTextField(document.activeElement)) {
                 return;
             }
+            if (keyboardNavigating && isFocusableControl(document.activeElement)) {
+                return;
+            }
             proxyEl.focus({ preventScroll: true });
         }
 
@@ -128,11 +161,15 @@
                 onScan = callback;
                 ensureProxy();
                 document.addEventListener('focusout', onFocusOut, true);
+                document.addEventListener('keydown', onDocumentKeydown, true);
+                document.addEventListener('mousedown', onPointerDown, true);
                 window.addEventListener('focus', refocusProxy);
                 refocusProxy();
             },
             stop: function () {
                 document.removeEventListener('focusout', onFocusOut, true);
+                document.removeEventListener('keydown', onDocumentKeydown, true);
+                document.removeEventListener('mousedown', onPointerDown, true);
                 window.removeEventListener('focus', refocusProxy);
                 onScan = null;
             },

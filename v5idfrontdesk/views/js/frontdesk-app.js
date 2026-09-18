@@ -12,6 +12,11 @@
     // Only one App instance is ever mounted per page, so a closure-level
     // variable here is equivalent to an instance property.
     var scannerChannel = null;
+    var onVisibilityChange = null;
+
+    var MANAGER_PING_INTERVAL_MS = 2000;
+    /** Three missed pings — the manager answers over BroadcastChannel, which the browser does not throttle. */
+    var MANAGER_SILENCE_MS = 6500;
 
     function api(action, params) {
         var body = new URLSearchParams(Object.assign({
@@ -26,7 +31,17 @@
             body: body.toString(),
             credentials: 'same-origin',
         }).then(function (res) {
-            return res.json();
+            if (!res.ok) {
+                throw new Error('The front desk server returned an error (HTTP ' + res.status + '). Please try again.');
+            }
+
+            return res.text().then(function (text) {
+                try {
+                    return JSON.parse(text);
+                } catch (e) {
+                    throw new Error('Your back office session has expired. Reload this page and sign in again.');
+                }
+            });
         });
     }
 
@@ -43,19 +58,34 @@
         return formatDate(d);
     }
 
+    /**
+     * An ID payload typed into the search field by a keyboard-wedge scanner
+     * must never reach SearchGuests. AAMVA opens with '@' or carries the ANSI
+     * marker; a passport MRZ carries the '<<' filler. None of the three
+     * occurs in a guest name, room number or order reference.
+     */
+    function looksLikeIdScan(term) {
+        return term.charAt(0) === '@' || term.indexOf('ANSI') !== -1 || term.indexOf('<<') !== -1;
+    }
+
+    var NO_BOOKINGS = [];
+
+    /** The banner carries the name, surname and age read off a guest document, so it does not sit on an unattended desk indefinitely. */
+    var SCAN_BANNER_TTL_MS = 60000;
+
     function guestName(row) {
         return [row.firstname, row.lastname].filter(Boolean).join(' ') || '—';
     }
 
-    var STATUS_LABEL = {};
-    STATUS_LABEL[cfg.statuses ? cfg.statuses.alloted : 1] = 'Reserved';
-    STATUS_LABEL[cfg.statuses ? cfg.statuses.checkedIn : 2] = 'In house';
-    STATUS_LABEL[cfg.statuses ? cfg.statuses.checkedOut : 3] = 'Checked out';
+    var STATUS_IDS = cfg.statuses || { alloted: 1, checkedIn: 2, checkedOut: 3 };
 
-    var STATUS_CLASS = {};
-    STATUS_CLASS[cfg.statuses ? cfg.statuses.alloted : 1] = 'is-alloted';
-    STATUS_CLASS[cfg.statuses ? cfg.statuses.checkedIn : 2] = 'is-checkedin';
-    STATUS_CLASS[cfg.statuses ? cfg.statuses.checkedOut : 3] = 'is-checkedout';
+    var STATUS_META = {};
+    STATUS_META[STATUS_IDS.alloted] = { label: 'Reserved', className: 'is-alloted' };
+    STATUS_META[STATUS_IDS.checkedIn] = { label: 'In house', className: 'is-checkedin' };
+    STATUS_META[STATUS_IDS.checkedOut] = { label: 'Checked out', className: 'is-checkedout' };
+
+    /** Most to least significant: one connected scanner makes the property's scanners connected, whatever the others report. */
+    var SCANNER_STATUS_PRIORITY = ['connected', 'reconnecting', 'connecting', 'error'];
 
     var App = {
         data: function () {
@@ -69,6 +99,11 @@
                 bookings: [],
                 loadingBoard: false,
                 errorMessage: '',
+                // Bumped per request so a slow reply for a property or search
+                // term the operator has already moved on from is discarded
+                // rather than rendered — see loadBoard() and runSearch().
+                boardSeq: 0,
+                searchSeq: 0,
 
                 searchTerm: '',
                 searchResults: [],
@@ -81,6 +116,7 @@
                 actionLoading: false,
 
                 scanBanner: null, // { result, matches }
+                scanBannerTimer: null,
 
                 // Comparison of the ID scan that led to the currently open
                 // booking against the guest's stored profile — null unless
@@ -102,7 +138,8 @@
                 scannerAdapters: cfg.scannerAdapters || [],
                 scannerStatuses: {}, // deviceId -> disconnected|connecting|connected|reconnecting|error — one entry per physical scanner, see scannerOverallStatus
                 managerAlive: false,
-                managerPollTimer: null,
+                managerLastSeenAt: 0,
+                managerPingTimer: null,
 
                 activity: [],
                 scans: [],
@@ -120,22 +157,11 @@
                 // than looking up a single status per enabled protocol,
                 // which would have one device's status silently clobber
                 // another's of the same protocol.
-                var statuses = Object.keys(this.scannerStatuses).map(function (deviceId) {
-                    return this.scannerStatuses[deviceId];
-                }.bind(this));
-                if (statuses.indexOf('connected') !== -1) {
-                    return 'connected';
-                }
-                if (statuses.indexOf('reconnecting') !== -1) {
-                    return 'reconnecting';
-                }
-                if (statuses.indexOf('connecting') !== -1) {
-                    return 'connecting';
-                }
-                if (statuses.indexOf('error') !== -1) {
-                    return 'error';
-                }
-                return 'disconnected';
+                var statuses = Object.values(this.scannerStatuses);
+
+                return SCANNER_STATUS_PRIORITY.find(function (candidate) {
+                    return statuses.indexOf(candidate) !== -1;
+                }) || 'disconnected';
             },
             scannerLabel: function () {
                 if (!this.managerAlive) {
@@ -159,6 +185,25 @@
             dateTo: function () {
                 return addDays(this.dateFrom, this.numDays - 1);
             },
+            /**
+             * Built once per board load rather than filtered per cell: the
+             * template asks for one room/day at a time, so a method scanning
+             * the whole bookings array ran rooms x days times on every
+             * render, including every keystroke in the search field.
+             */
+            bookingsByRoomDay: function () {
+                var map = {};
+                var days = this.days;
+                this.bookings.forEach(function (b) {
+                    days.forEach(function (d) {
+                        if (b.date_from <= d + ' 23:59:59' && b.date_to > d + ' 00:00:00') {
+                            var key = b.id_room + '|' + d;
+                            (map[key] = map[key] || []).push(b);
+                        }
+                    });
+                });
+                return map;
+            },
             roomsByFloor: function () {
                 var groups = {};
                 this.rooms.forEach(function (r) {
@@ -180,13 +225,27 @@
             }
 
             this.setupScannerChannel();
+
+            // A hidden board tab has its own ping interval throttled too, so
+            // coming back to it could otherwise show a stale scanner badge
+            // until the next throttled tick, up to a minute away.
+            onVisibilityChange = function () {
+                if (!document.hidden && scannerChannel) {
+                    scannerChannel.send('ping');
+                }
+            };
+            document.addEventListener('visibilitychange', onVisibilityChange);
         },
         beforeUnmount: function () {
             if (window.V5idScannerListener) {
                 window.V5idScannerListener.stop();
             }
-            if (this.managerPollTimer) {
-                window.clearInterval(this.managerPollTimer);
+            document.removeEventListener('visibilitychange', onVisibilityChange);
+            if (this.managerPingTimer) {
+                window.clearInterval(this.managerPingTimer);
+            }
+            if (this.scanBannerTimer) {
+                window.clearTimeout(this.scanBannerTimer);
             }
             if (scannerChannel) {
                 scannerChannel.close();
@@ -197,7 +256,7 @@
             /**
              * (Re)binds the scanner channel to the currently selected
              * hotel — called on mount and again on every onHotelChange().
-             * Tears down the previous hotel's channel/heartbeat-poll first:
+             * Tears down the previous hotel's channel/ping-poll first:
              * each hotel gets its own BroadcastChannel (see
              * scanner-channel.js), so switching properties without this
              * would leave the board listening to the old hotel's channel,
@@ -205,9 +264,9 @@
              * two properties' Scanner Manager tabs together.
              */
             setupScannerChannel: function () {
-                if (this.managerPollTimer) {
-                    window.clearInterval(this.managerPollTimer);
-                    this.managerPollTimer = null;
+                if (this.managerPingTimer) {
+                    window.clearInterval(this.managerPingTimer);
+                    this.managerPingTimer = null;
                 }
                 if (scannerChannel) {
                     scannerChannel.close();
@@ -215,6 +274,7 @@
                 }
                 this.scannerStatuses = {};
                 this.managerAlive = false;
+                this.managerLastSeenAt = 0;
 
                 if (!window.V5idScannerChannel || !this.idHotel || !this.scannerAdapters.length) {
                     return;
@@ -226,46 +286,39 @@
                 }
 
                 // Any message at all proves the manager tab is alive *right
-                // now* — set this directly rather than waiting for the next
-                // managerPollTimer tick (up to 2s away, and background tabs
-                // can throttle setInterval well past that in some browsers).
-                // A reconnecting device is actively sending 'status'
-                // messages, so this makes the badge track it immediately.
+                // now*, so every handler refreshes the liveness stamp rather
+                // than only the dedicated 'pong'.
                 scannerChannel.on('scan', function (payload) {
-                    this.managerAlive = true;
+                    this.markManagerSeen();
                     this.handleScan(payload.data, payload.serial);
                 }.bind(this));
                 scannerChannel.on('status', function (payload) {
-                    this.managerAlive = true;
+                    this.markManagerSeen();
                     this.scannerStatuses[payload.deviceId] = payload.status;
                 }.bind(this));
                 scannerChannel.on('error', function (payload) {
-                    this.managerAlive = true;
+                    this.markManagerSeen();
                     var adapter = this.scannerAdapters.find(function (a) { return a.id === payload.adapterId; });
                     this.errorMessage = (adapter ? adapter.label : payload.adapterId) + ': ' + payload.message;
                 }.bind(this));
+                scannerChannel.on('pong', this.markManagerSeen.bind(this));
 
-                this.managerAlive = scannerChannel.isManagerAlive();
-                if (this.managerAlive) {
-                    // Picks up whatever the manager is already doing — e.g.
-                    // it connected before this tab loaded, or before we
-                    // navigated back to this page — instead of showing
-                    // "disconnected" until its next status change happens
-                    // to broadcast one.
-                    scannerChannel.send('query-status');
-                }
-                this.managerPollTimer = window.setInterval(function () {
+                scannerChannel.send('ping');
+                this.managerPingTimer = window.setInterval(function () {
                     if (!scannerChannel) {
                         return;
                     }
-                    var alive = scannerChannel.isManagerAlive();
-                    if (alive && !this.managerAlive) {
-                        // The manager tab just appeared (or its heartbeat
-                        // just caught back up) — ask it for a fresh snapshot.
-                        scannerChannel.send('query-status');
+                    if (this.managerAlive && (Date.now() - this.managerLastSeenAt) > MANAGER_SILENCE_MS) {
+                        this.managerAlive = false;
+                        this.scannerStatuses = {};
                     }
-                    this.managerAlive = alive;
-                }.bind(this), 2000);
+                    scannerChannel.send('ping');
+                }.bind(this), MANAGER_PING_INTERVAL_MS);
+            },
+
+            markManagerSeen: function () {
+                this.managerLastSeenAt = Date.now();
+                this.managerAlive = true;
             },
 
             /**
@@ -293,21 +346,34 @@
                 }
             },
             statusLabel: function (idStatus) {
-                return STATUS_LABEL[idStatus] || '—';
+                return STATUS_META[idStatus] ? STATUS_META[idStatus].label : '—';
             },
             statusClass: function (idStatus) {
-                return STATUS_CLASS[idStatus] || '';
+                return STATUS_META[idStatus] ? STATUS_META[idStatus].className : '';
             },
             guestName: guestName,
+
+            apiFailed: function (loadingFlag, fallback) {
+                return function (err) {
+                    if (loadingFlag) {
+                        this[loadingFlag] = false;
+                    }
+                    this.errorMessage = (err && err.message) ? err.message : fallback;
+                }.bind(this);
+            },
 
             loadBoard: function () {
                 if (!this.idHotel) {
                     return;
                 }
+                var seq = ++this.boardSeq;
                 this.loadingBoard = true;
                 this.errorMessage = '';
                 api('GetBoard', { id_hotel: this.idHotel, date_from: this.dateFrom, date_to: this.dateTo })
                     .then(function (res) {
+                        if (seq !== this.boardSeq) {
+                            return;
+                        }
                         this.loadingBoard = false;
                         if (!res.success) {
                             this.errorMessage = res.message || 'Could not load the board.';
@@ -316,9 +382,11 @@
                         this.rooms = res.rooms;
                         this.bookings = res.bookings;
                     }.bind(this))
-                    .catch(function () {
-                        this.loadingBoard = false;
-                        this.errorMessage = 'Network error while loading the board.';
+                    .catch(function (err) {
+                        if (seq !== this.boardSeq) {
+                            return;
+                        }
+                        this.apiFailed('loadingBoard', 'Network error while loading the board.')(err);
                     }.bind(this));
             },
 
@@ -331,7 +399,7 @@
                         this.activity = res.activity;
                         this.scans = res.scans;
                     }
-                }.bind(this));
+                }.bind(this)).catch(this.apiFailed('', 'Could not load recent activity.'));
             },
 
             shiftDates: function (days) {
@@ -344,19 +412,27 @@
             },
             onHotelChange: function () {
                 this.selected = null;
+                this.searchResults = [];
+                this.setScanBanner(null);
+                this.searchSeq++;
                 this.loadBoard();
                 this.loadActivity();
                 this.setupScannerChannel();
             },
 
             bookingsForRoomDay: function (idRoom, day) {
-                return this.bookings.filter(function (b) {
-                    return b.id_room == idRoom && b.date_from <= day + ' 23:59:59' && b.date_to > day + ' 00:00:00';
-                });
+                return this.bookingsByRoomDay[idRoom + '|' + day] || NO_BOOKINGS;
             },
 
             onSearchInput: function () {
                 clearTimeout(this.searchTimer);
+                // Every edit abandons a request already in flight, clearing
+                // the field included — otherwise its reply arrives during the
+                // debounce and repopulates a dropdown the operator has moved
+                // on from, or emptied. Nothing will clear `searching` for an
+                // abandoned request, so do it here.
+                this.searchSeq++;
+                this.searching = false;
                 if (!this.searchTerm.trim()) {
                     this.searchResults = [];
                     return;
@@ -367,12 +443,33 @@
                 if (!this.idHotel) {
                     return;
                 }
+                if (looksLikeIdScan(this.searchTerm)) {
+                    // The scanner emitted into the search field because it
+                    // held focus (see scanner-listener.js). The debounce has
+                    // already waited out the burst, so the term is the whole
+                    // payload — validate it instead of searching for it.
+                    var scanned = this.searchTerm;
+                    this.searchTerm = '';
+                    this.searchResults = [];
+                    this.handleScan(scanned);
+                    return;
+                }
+
+                var seq = ++this.searchSeq;
                 this.searching = true;
                 api('SearchGuests', { id_hotel: this.idHotel, term: this.searchTerm }).then(function (res) {
+                    if (seq !== this.searchSeq) {
+                        return;
+                    }
                     this.searching = false;
                     if (res.success) {
                         this.searchResults = res.results;
                     }
+                }.bind(this)).catch(function (err) {
+                    if (seq !== this.searchSeq) {
+                        return;
+                    }
+                    this.apiFailed('searching', 'Could not search guests.')(err);
                 }.bind(this));
             },
 
@@ -386,7 +483,7 @@
             openBooking: function (booking, scanResult) {
                 this.selected = booking;
                 this.swap = null;
-                this.scanBanner = null;
+                this.setScanBanner(null);
                 this.profileCheck = null;
                 this.profileCheckScan = null;
                 if (scanResult && scanResult.valid) {
@@ -424,7 +521,7 @@
                     if (res.success) {
                         this.profileCheck = res;
                     }
-                }.bind(this));
+                }.bind(this)).catch(this.apiFailed('profileCheckLoading', 'Could not check the guest profile.'));
             },
             applyGuestProfile: function () {
                 if (!this.profileCheck || !this.profileCheck.check.canAutoApply.length || !this.selected || !this.profileCheckScan) {
@@ -442,7 +539,7 @@
                         return;
                     }
                     this.profileCheck = res;
-                }.bind(this));
+                }.bind(this)).catch(this.apiFailed('profileApplyLoading', 'Could not update the guest record.'));
             },
             profileStatusLabel: function (status) {
                 switch (status) {
@@ -475,7 +572,7 @@
                     this.selected.check_out = res.booking.check_out;
                     this.loadBoard();
                     this.loadActivity();
-                }.bind(this));
+                }.bind(this)).catch(this.apiFailed('actionLoading', 'Action failed.'));
             },
 
             openSwap: function () {
@@ -490,7 +587,7 @@
                     } else {
                         this.errorMessage = res.message || 'Could not load swap candidates.';
                     }
-                }.bind(this));
+                }.bind(this)).catch(this.apiFailed('swapLoading', 'Could not load swap candidates.'));
             },
             moveToRoom: function (idRoom) {
                 this.runSwap({ mode: 'move', id_room_to: idRoom });
@@ -514,7 +611,7 @@
                     this.selected = null;
                     this.loadBoard();
                     this.loadActivity();
-                }.bind(this));
+                }.bind(this)).catch(this.apiFailed('actionLoading', 'Could not move the room.'));
             },
 
             /**
@@ -530,21 +627,68 @@
                 if (!this.idHotel) {
                     return;
                 }
-                this.scanBanner = { loading: true };
-                api('ScanValidate', { id_hotel: this.idHotel, scan: raw, device_serial: serial || '' }).then(function (res) {
-                    if (!res.success) {
-                        this.scanBanner = { loading: false, error: res.message || 'Scan failed.' };
+                // The matches come back scoped to the property that asked for
+                // them, so a reply arriving after the operator switched would
+                // reopen the cleared banner and could open a booking that
+                // belongs to the previous property.
+                var idHotel = this.idHotel;
+                this.setScanBanner({ loading: true });
+                api('ScanValidate', { id_hotel: idHotel, scan: raw, device_serial: serial || '' }).then(function (res) {
+                    if (idHotel !== this.idHotel) {
                         return;
                     }
-                    this.scanBanner = { loading: false, result: res.result, matches: res.matches };
+                    if (!res.success) {
+                        this.setScanBanner({ loading: false, error: res.message || 'Scan failed.' });
+                        return;
+                    }
+                    this.setScanBanner({ loading: false, result: res.result, matches: res.matches });
                     if (res.matches && res.matches.length === 1) {
                         this.openBooking(res.matches[0], res.result);
                     }
                     this.loadActivity();
+                }.bind(this)).catch(function (err) {
+                    if (idHotel !== this.idHotel) {
+                        return;
+                    }
+                    this.setScanBanner({ loading: false, error: (err && err.message) ? err.message : 'Scan failed.' });
                 }.bind(this));
             },
+            setScanBanner: function (banner) {
+                if (this.scanBannerTimer) {
+                    window.clearTimeout(this.scanBannerTimer);
+                    this.scanBannerTimer = null;
+                }
+                this.scanBanner = banner;
+                if (banner && !banner.loading) {
+                    this.scanBannerTimer = window.setTimeout(function () {
+                        this.scanBanner = null;
+                        this.scanBannerTimer = null;
+                    }.bind(this), SCAN_BANNER_TTL_MS);
+                }
+            },
+            scanOutcome: function (result) {
+                if (result.valid) {
+                    return 'verified';
+                }
+
+                return (result.errors && result.errors.length) ? 'rejected' : 'unavailable';
+            },
+            scanOutcomeLabel: function (result) {
+                switch (this.scanOutcome(result)) {
+                    case 'verified': return 'ID verified';
+                    case 'rejected': return 'ID did not validate';
+                    default: return 'ID could not be checked';
+                }
+            },
+            scanOutcomeDetail: function (result) {
+                if (result.errors && result.errors.length) {
+                    return result.errors.join(', ');
+                }
+
+                return result.valid ? '' : (result.message || '');
+            },
             dismissScanBanner: function () {
-                this.scanBanner = null;
+                this.setScanBanner(null);
             },
         },
         template:
@@ -563,9 +707,10 @@
             '    </div>' +
             '    <div class="v5idfd-toolbar-right">' +
             '      <div class="v5idfd-search">' +
-            '        <input type="text" v-model="searchTerm" @input="onSearchInput" placeholder="Search guest, room, order…">' +
-            '        <div class="v5idfd-search-results" v-if="searchResults.length">' +
-            '          <div class="v5idfd-search-row" v-for="r in searchResults" :key="r.id_hotel_booking_detail" @click="selectSearchResult(r)">' +
+            '        <input type="text" v-model="searchTerm" @input="onSearchInput" @keydown.esc="searchResults = []" role="combobox" :aria-expanded="searchResults.length > 0" aria-controls="v5idfd-search-list" placeholder="Search guest, room, order…">' +
+            '        <div class="v5idfd-search-results" id="v5idfd-search-list" role="listbox" v-if="searchResults.length">' +
+            '          <div class="v5idfd-search-row" v-for="r in searchResults" :key="r.id_hotel_booking_detail" role="option" tabindex="0"' +
+            '               @click="selectSearchResult(r)" @keydown.enter.prevent="selectSearchResult(r)" @keydown.space.prevent="selectSearchResult(r)" @keydown.esc="searchResults = []">' +
             '            <strong>{{ guestName(r) }}</strong>' +
             '            <span>Room {{ r.room_num }} · {{ r.date_from.substr(0,10) }} → {{ r.date_to.substr(0,10) }}</span>' +
             '          </div>' +
@@ -600,7 +745,9 @@
             '          </div>' +
             '          <div class="v5idfd-day-col" v-for="d in days" :key="d">' +
             '            <div v-for="b in bookingsForRoomDay(room.id_room, d)" :key="b.id_hotel_booking_detail"' +
-            '                 class="v5idfd-cell" :class="statusClass(b.id_status)" @click="openBooking(b)">' +
+            '                 class="v5idfd-cell" :class="statusClass(b.id_status)" role="button" tabindex="0"' +
+            '                 :aria-label="guestName(b) + \', room \' + room.room_num + \', \' + statusLabel(b.id_status)"' +
+            '                 @click="openBooking(b)" @keydown.enter.prevent="openBooking(b)" @keydown.space.prevent="openBooking(b)">' +
             '              {{ guestName(b) }}' +
             '            </div>' +
             '          </div>' +
@@ -680,11 +827,11 @@
             '    <div v-if="scanBanner.loading">Validating scan…</div>' +
             '    <div v-else-if="scanBanner.error">{{ scanBanner.error }}</div>' +
             '    <div v-else>' +
-            '      <div class="v5idfd-scan-result" :class="scanBanner.result.valid ? \'ok\' : \'bad\'">' +
-            '        <strong>{{ scanBanner.result.valid ? \'ID verified\' : \'ID did not validate\' }}</strong>' +
+            '      <div class="v5idfd-scan-result" :class="\'is-\' + scanOutcome(scanBanner.result)">' +
+            '        <strong>{{ scanOutcomeLabel(scanBanner.result) }}</strong>' +
             '        <span v-if="scanBanner.result.firstName">{{ scanBanner.result.firstName }} {{ scanBanner.result.lastName }}</span>' +
             '        <span v-if="scanBanner.result.age">· {{ scanBanner.result.age }} yrs</span>' +
-            '        <span v-if="!scanBanner.result.valid">{{ scanBanner.result.errors.join(\', \') }}</span>' +
+            '        <span v-if="scanOutcomeDetail(scanBanner.result)">{{ scanOutcomeDetail(scanBanner.result) }}</span>' +
             '      </div>' +
             '      <div class="v5idfd-scan-matches" v-if="scanBanner.matches && scanBanner.matches.length > 1">' +
             '        <p>Multiple bookings match this name — pick one:</p>' +
@@ -692,7 +839,7 @@
             '          Room {{ m.room_num }} — {{ guestName(m) }}' +
             '        </button>' +
             '      </div>' +
-            '      <p v-else-if="scanBanner.matches && !scanBanner.matches.length" class="v5idfd-muted">No matching arrival found — search manually if needed.</p>' +
+            '      <p v-else-if="scanBanner.result.valid && scanBanner.matches && !scanBanner.matches.length" class="v5idfd-muted">No matching arrival found — search manually if needed.</p>' +
             '    </div>' +
             '    <button class="v5idfd-panel-close" @click="dismissScanBanner">&times;</button>' +
             '  </div>' +

@@ -300,6 +300,12 @@
     text-overflow: ellipsis;
 }
 
+.v5idfd-cell:focus-visible,
+.v5idfd-search-row:focus-visible {
+    outline: 2px solid var(--v5fd-primary);
+    outline-offset: -2px;
+}
+
 .v5idfd-cell:hover {
     filter: brightness(0.97);
 }
@@ -589,12 +595,16 @@
     font-size: 14px;
 }
 
-.v5idfd-scan-result.ok strong {
+.v5idfd-scan-result.is-verified strong {
     color: var(--v5fd-checkedin);
 }
 
-.v5idfd-scan-result.bad strong {
+.v5idfd-scan-result.is-rejected strong {
     color: #b91c1c;
+}
+
+.v5idfd-scan-result.is-unavailable strong {
+    color: var(--v5fd-alloted);
 }
 
 .v5idfd-scan-matches {

@@ -34,6 +34,8 @@
 (function (window, document, navigator) {
     'use strict';
 
+    var support = window.V5idScannerSupport;
+
     // Dynamic import() from a classic (non-module) script resolves a
     // relative specifier against the *page's* URL, not this script's own —
     // so a plain '../vendor/magtek/...' string here would resolve wrong
@@ -43,8 +45,13 @@
     // base has to be captured right here, before anything async happens.
     var VENDOR_BASE = (function () {
         var scriptEl = document.currentScript;
-        var scriptUrl = scriptEl ? scriptEl.src : '';
-        var withoutQuery = scriptUrl.split('?')[0];
+        if (!scriptEl || !scriptEl.src) {
+            // Falling back to a relative specifier here would resolve against
+            // the admin page URL - exactly what the note above exists to
+            // prevent - and fail as an unexplained 404 at connect time.
+            return null;
+        }
+        var withoutQuery = scriptEl.src.split('?')[0];
         var scannersDir = withoutQuery.substring(0, withoutQuery.lastIndexOf('/') + 1);
         return scannersDir + '../vendor/magtek/';
     })();
@@ -68,9 +75,18 @@
     var connectedInstance = null;
 
     function loadSdk() {
+        if (!VENDOR_BASE) {
+            return Promise.reject(new Error('The MagTek adapter could not locate its vendor SDK because it was not loaded as a classic script tag.'));
+        }
         if (!loadPromise) {
             loadPromise = import(VENDOR_BASE + 'device/API_device_mmsHID.js').then(function (mod) {
                 MagTekHIDDevice = mod.default;
+            }).catch(function (err) {
+                // A rejected promise is still truthy, so keeping it would
+                // make every later attempt replay the same failure until the
+                // page was reloaded.
+                loadPromise = null;
+                throw err;
             });
         }
         return loadPromise;
@@ -94,30 +110,14 @@
 
         var barcodeText = rawData;
         if (/^[0-9A-Fa-f]+$/.test(rawData) && rawData.length % 2 === 0) {
-            try {
-                var decoded = '';
-                for (var i = 0; i < rawData.length; i += 2) {
-                    decoded += String.fromCharCode(parseInt(rawData.substr(i, 2), 16));
-                }
-                barcodeText = decoded;
-            } catch (err) {
-                /* not actually hex — use as-is */
+            var decoded = '';
+            for (var i = 0; i < rawData.length; i += 2) {
+                decoded += String.fromCharCode(parseInt(rawData.substr(i, 2), 16));
             }
+            barcodeText = decoded;
         }
 
-        var ansiIdx = barcodeText.indexOf('ANSI');
-        if (ansiIdx < 0) {
-            return null;
-        }
-        var startIdx = ansiIdx;
-        for (var j = ansiIdx - 1; j >= Math.max(0, ansiIdx - 20); j--) {
-            if (barcodeText[j] === '@') {
-                startIdx = j;
-                break;
-            }
-        }
-
-        return barcodeText.substring(startIdx);
+        return support.extractIdPayload(barcodeText);
     }
 
     function createInstance() {

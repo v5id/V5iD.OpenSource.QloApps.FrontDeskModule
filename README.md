@@ -77,8 +77,12 @@ sure the same serial is already registered for this property on
    your Front Desk tabs.
 2. Pick the scanner's protocol (e.g. Bluetooth GATT) and connect it — the
    adapter reads the physical unit's serial number directly from the device.
-   Once paired, that unit is remembered for this property and reconnects
-   automatically next time.
+   Once paired, that unit is remembered for this property: its serial and
+   label are stored, and it gets its own row in Scanner Manager. The browser
+   still shows its own device chooser each time you click **Connect** on that
+   row, because the browser-side pairing is not retained; pick the same unit
+   and the module checks that the serial it reports matches the one on the
+   row, refusing to connect if you pick a different one.
 
 A scanner paired at one property is never visible or usable at another.
 

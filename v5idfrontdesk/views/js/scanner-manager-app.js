@@ -64,18 +64,19 @@
             headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
             body: body.toString(),
             credentials: 'same-origin',
-        }).then(function (res) { return res.json(); });
-    }
+        }).then(function (res) {
+            if (!res.ok) {
+                throw new Error('The front desk server returned an error (HTTP ' + res.status + ').');
+            }
 
-    function isProtocolUsable(protocol) {
-        if (!protocol) {
-            return false;
-        }
-        try {
-            return !!protocol.isSupported();
-        } catch (e) {
-            return false;
-        }
+            return res.text().then(function (text) {
+                try {
+                    return JSON.parse(text);
+                } catch (e) {
+                    throw new Error('Your back office session has expired. Reload this page and sign in again.');
+                }
+            });
+        });
     }
 
     function makeLogger(container) {
@@ -90,17 +91,22 @@
 
     /**
      * One row for an already-known, previously-paired device — id_hotel,
-     * adapter_id and serial (see V5idFrontDeskScannerDevice) already
-     * identify this exact physical unit, so connecting it doesn't need the
-     * device chooser to reappear (browser support for reconnect-without-a-
-     * prompt permitting — see the protocol's own isSupported()/connect()).
+     * adapter_id and serial (see V5idFrontDeskScannerDevice) identify this
+     * exact physical unit server-side. The browser chooser still appears on
+     * every Connect, because no adapter calls navigator.bluetooth.getDevices()
+     * and the browser-side pairing is not retained across page loads; what the
+     * stored serial buys is the check below that the unit actually chosen is
+     * the one this row was paired with.
      *
      * @param {object} device Row from GetScannerDevices — {id, adapter_id, serial, label}.
      * @param {Element} root
+     * @param {function():void} onRemoved Called once the device is deleted server-side.
      */
-    function buildDeviceRow(device, root) {
+    function buildDeviceRow(device, root, onRemoved) {
         var protocol = registry.get(device.adapter_id);
-        var usable = isProtocolUsable(protocol);
+        // registry.available() already wraps isSupported() in the same
+        // try/catch this used to repeat.
+        var usable = !!protocol && registry.available().indexOf(protocol) !== -1;
         var status = 'disconnected';
         var instance = null;
 
@@ -124,6 +130,11 @@
         var log = el('div', 'v5sm-log');
         row.appendChild(log);
         var logLine = makeLogger(log);
+
+        function reportError(message) {
+            channel.send('error', { deviceId: device.id, adapterId: device.adapter_id, message: message });
+            logLine('Error: ' + message);
+        }
 
         function setStatus(next) {
             status = next;
@@ -157,46 +168,90 @@
                 return;
             }
 
+            // An adapter subscribes to notifications before it has read the
+            // unit's serial, so a scan can arrive while the identity check
+            // below is still pending — on Tera that window is the whole
+            // serial handshake. Forwarding it straight away would file it
+            // under this row's registered serial before we know the operator
+            // picked this unit at all, so scans are held until the check
+            // passes and dropped if it does not.
+            var identityConfirmed = false;
+            var heldScans = [];
+
+            function forwardScan(raw) {
+                // serial travels with the scan (not just deviceId/adapterId)
+                // because the Front Desk board forwards it straight through
+                // to V5id's own scan-validation API, which requires a
+                // registered device serial on every request.
+                channel.send('scan', { deviceId: device.id, adapterId: device.adapter_id, serial: device.serial, data: raw });
+                // Confirms a scan came through without echoing any of its
+                // decoded content (name, DOB, document number, ...) to
+                // the screen — this tab is for pairing/monitoring
+                // devices, not for reading what's on anyone's ID.
+                logLine('Scan received (' + raw.length + ' chars) at ' + new Date().toLocaleTimeString());
+            }
+
             instance = protocol.createInstance();
             instance.connect({
                 onScan: function (raw) {
-                    // serial travels with the scan (not just deviceId/adapterId)
-                    // because the Front Desk board forwards it straight through
-                    // to V5id's own scan-validation API, which requires a
-                    // registered device serial on every request.
-                    channel.send('scan', { deviceId: device.id, adapterId: device.adapter_id, serial: device.serial, data: raw });
-                    // Confirms a scan came through without echoing any of its
-                    // decoded content (name, DOB, document number, ...) to
-                    // the screen — this tab is for pairing/monitoring
-                    // devices, not for reading what's on anyone's ID.
-                    logLine('Scan received (' + raw.length + ' chars) at ' + new Date().toLocaleTimeString());
+                    if (!identityConfirmed) {
+                        heldScans.push(raw);
+                        return;
+                    }
+                    forwardScan(raw);
                 },
                 onStatusChange: setStatus,
-                onError: function (message) {
-                    channel.send('error', { deviceId: device.id, adapterId: device.adapter_id, message: message });
-                    logLine('Error: ' + message);
-                },
+                onError: reportError,
+            }).then(function (result) {
+                // The serial sent with every scan comes from the database
+                // row, so connecting this row to a different physical unit
+                // would file that unit's scans under this one's registered
+                // serial, in the module scan log and in the V5iD portal
+                // alike. A unit that reports no serial at all is not
+                // confirmed either: pairing refuses a device without one, so
+                // every row here has a serial that a genuine match can be
+                // held against.
+                var reported = result && result.serial;
+                if (reported !== device.serial) {
+                    heldScans = [];
+                    instance.disconnect();
+                    instance = null;
+                    reportError(reported
+                        ? 'This is a different unit: it reports serial ' + reported + ', but this row is paired with ' + device.serial + '.'
+                        : 'This unit didn’t report a serial number, so it can’t be confirmed as ' + device.serial + '. Try connecting it again.');
+                    setStatus('error');
+                    return;
+                }
+
+                identityConfirmed = true;
+                heldScans.forEach(forwardScan);
+                heldScans = [];
             }).catch(function () {
                 // Status/error already reported through the callbacks above
                 // (e.g. the user cancelled the device chooser).
+                heldScans = [];
             });
         });
 
         removeBtn.addEventListener('click', function () {
-            if (status === 'connected' || status === 'reconnecting') {
-                if (instance) {
-                    instance.disconnect();
-                }
-            }
+            // Confirm before acting: disconnecting first left a cancelled
+            // removal with the scanner torn down anyway, and scans simply
+            // stopped arriving.
             if (!window.confirm('Remove "' + device.label + '"? You can pair it again later.')) {
                 return;
+            }
+            if (instance) {
+                instance.disconnect();
             }
             api('DeleteScannerDevice', { id_hotel: config.idHotel, id_device: device.id }).then(function (res) {
                 if (res.success) {
                     row.remove();
+                    onRemoved();
                 } else {
                     logLine(res.message || 'Could not remove this scanner.');
                 }
+            }).catch(function (err) {
+                logLine((err && err.message) ? err.message : 'Could not remove this scanner.');
             });
         });
 
@@ -208,7 +263,7 @@
                     instance.disconnect();
                 }
             },
-            // Lets boot()'s 'query-status' handler answer with what this row
+            // Lets boot()'s 'ping' handler answer with what this row
             // actually shows right now, not just what it was at the moment
             // it last changed — a board tab that (re)loads after a status
             // change already happened would otherwise never learn it, since
@@ -308,6 +363,8 @@
                     } else {
                         logLine(res.message || 'Could not save this scanner.');
                     }
+                }).catch(function (err) {
+                    logLine((err && err.message) ? err.message : 'Could not save this scanner.');
                 });
             }).catch(function () {
                 btn.disabled = false;
@@ -351,7 +408,17 @@
             if (emptyNotice.parentNode) {
                 emptyNotice.remove();
             }
-            rows.push(buildDeviceRow(device, listRoot));
+            var entry = buildDeviceRow(device, listRoot, function () {
+                // The ping handler below answers on behalf of everything in
+                // rows, so a deleted device must leave it too or board tabs
+                // keep being told about a scanner that no longer exists.
+                var index = rows.indexOf(entry);
+                if (index !== -1) {
+                    rows.splice(index, 1);
+                }
+                delete renderedIds[device.id];
+            });
+            rows.push(entry);
         }
 
         api('GetScannerDevices', { id_hotel: config.idHotel }).then(function (res) {
@@ -363,6 +430,8 @@
                 listRoot.appendChild(emptyNotice);
             }
             res.devices.forEach(addDeviceRow);
+        }).catch(function (err) {
+            root.appendChild(el('div', 'v5sm-warning', (err && err.message) ? err.message : 'Could not load scanners for this property.'));
         });
 
         buildPairSection(root, function (devices) {
@@ -371,16 +440,16 @@
             devices.forEach(addDeviceRow);
         });
 
-        // A board tab asks for this right after it (re)mounts, so it can
-        // show the real current state immediately instead of guessing
-        // "disconnected" until the next status change happens to fire.
-        channel.on('query-status', function () {
+        // Board tabs ping on a short interval; answering proves this tab is
+        // open right now, and replaying every row's status means a board tab
+        // that (re)mounted after a status change already happened still sees
+        // the real current state rather than guessing "disconnected".
+        channel.on('ping', function () {
+            channel.send('pong');
             rows.forEach(function (row) {
                 channel.send('status', row.currentStatus());
             });
         });
-
-        channel.startHeartbeat();
 
         window.addEventListener('beforeunload', function () {
             rows.forEach(function (row) {

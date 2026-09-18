@@ -26,6 +26,8 @@
 (function (window, navigator) {
     'use strict';
 
+    var support = window.V5idScannerSupport;
+
     // ── BLE constants (Marson / MT-810 — confirmed via live GATT discovery
     // against the reference client) ─────────────────────────────────────
     var SVC = '0000feea-0000-1000-8000-00805f9b34fb'; // vendor-custom (Birch)
@@ -137,29 +139,11 @@
                 /* not exposed on this device — expected, fall through */
             }
 
-            // Web Bluetooth's own per-origin device id, as a last resort — a
-            // stable-enough fallback so pairing can still succeed even if
-            // neither the vendor command nor 2a25 answered.
-            return device && device.id ? device.id : null;
-        }
-
-        async function connectGatt(maxAttempts) {
-            maxAttempts = maxAttempts || 4;
-            for (var attempt = 1; attempt <= maxAttempts; attempt++) {
-                try {
-                    var srv = await device.gatt.connect();
-                    await new Promise(function (r) { setTimeout(r, 350); });
-                    if (!device.gatt.connected) {
-                        throw new Error('Link dropped immediately after connect');
-                    }
-                    return srv;
-                } catch (e) {
-                    if (attempt === maxAttempts) {
-                        throw e;
-                    }
-                    await new Promise(function (r) { setTimeout(r, 800 * attempt); });
-                }
-            }
+            // No browser-generated fallback: device.id is a Web Bluetooth
+            // identifier scoped to this origin and profile, not the serial
+            // the V5iD portal holds, so pairing under it would succeed while
+            // every later scan was rejected for an unregistered device.
+            return null;
         }
 
         async function setupServices() {
@@ -187,7 +171,7 @@
             notifyBytes = [];
             var text = new TextDecoder('utf-8', { fatal: false }).decode(bytes);
 
-            if (pendingSerialResolve) {
+            if (pendingSerialResolve && !support.looksLikeIdScan(text)) {
                 var resolve = pendingSerialResolve;
                 pendingSerialResolve = null;
                 resolve(text);
@@ -197,9 +181,6 @@
             processBarcode(text);
         }
 
-        // Same AAMVA/ANSI marker + '@' backtrack as inateck-ble-adapter.js
-        // and magtek-hid-adapter.js's extractBarcode() — this unit doesn't
-        // hex-encode its payload, so no hex-decode step is needed first.
         function processBarcode(bcData) {
             if (!bcData) {
                 return;
@@ -209,23 +190,13 @@
                 return;
             }
 
-            var ansiIdx = barcodeText.indexOf('ANSI');
-            if (ansiIdx < 0 && barcodeText.length < 50) {
+            var payload = support.extractIdPayload(barcodeText);
+            if (payload === null) {
                 return;
-            }
-            if (ansiIdx >= 0) {
-                var startIdx = ansiIdx;
-                for (var j = ansiIdx - 1; j >= Math.max(0, ansiIdx - 20); j--) {
-                    if (barcodeText[j] === '@') {
-                        startIdx = j;
-                        break;
-                    }
-                }
-                barcodeText = barcodeText.substring(startIdx);
             }
 
             if (typeof onScan === 'function') {
-                onScan(barcodeText);
+                onScan(payload);
             }
         }
 
@@ -258,11 +229,14 @@
                 return;
             }
             try {
-                server = await connectGatt(2);
+                server = await support.connectGatt(device, 2);
                 await setupServices();
                 stopReconnect();
                 setStatus('connected');
             } catch (e) {
+                // Deliberately unbounded: these units sleep when idle and
+                // must come back on their own when they wake, so a ceiling
+                // would strand a scanner that was simply left alone.
                 scheduleReconnect(3000);
             }
         }
@@ -310,7 +284,7 @@
                         device.addEventListener('gattserverdisconnected', handleDisconnect);
                     }
 
-                    server = await connectGatt();
+                    server = await support.connectGatt(device);
                     await setupServices();
 
                     var serial = await getSerialNumber();

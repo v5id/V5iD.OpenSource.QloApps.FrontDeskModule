@@ -1,10 +1,10 @@
 <!DOCTYPE html>
-<html>
+<html lang="{$pageLang|escape:'htmlall':'UTF-8'}">
 <head>
 <meta charset="utf-8">
 <title>{if $hotelName}{l s='V5iD Scanner Manager' mod='v5idfrontdesk'} — {$hotelName|escape:'html':'UTF-8'}{else}{l s='V5iD Scanner Manager' mod='v5idfrontdesk'}{/if}</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<link rel="stylesheet" href="{$cssUrl}">
+<link rel="stylesheet" href="{$cssUrl|escape:'htmlall':'UTF-8'}">
 </head>
 <body>
 <div class="v5sm-shell">
@@ -17,12 +17,13 @@
 	<div id="v5idfrontdesk-scanner-manager" class="v5sm-list"></div>
 </div>
 
-<script src="{$registryJsUrl}"></script>
+<script src="{$registryJsUrl|escape:'htmlall':'UTF-8'}"></script>
+<script src="{$adapterSupportJsUrl|escape:'htmlall':'UTF-8'}"></script>
 {foreach from=$adapterJsUrls item=adapterJsUrl}
-	<script src="{$adapterJsUrl}"></script>
+	<script src="{$adapterJsUrl|escape:'htmlall':'UTF-8'}"></script>
 {/foreach}
-<script src="{$channelJsUrl}"></script>
+<script src="{$channelJsUrl|escape:'htmlall':'UTF-8'}"></script>
 <script>window.v5idScannerManagerConfig = JSON.parse('{$configJson|escape:'javascript':'UTF-8'}');</script>
-<script src="{$managerAppJsUrl}"></script>
+<script src="{$managerAppJsUrl|escape:'htmlall':'UTF-8'}"></script>
 </body>
 </html>

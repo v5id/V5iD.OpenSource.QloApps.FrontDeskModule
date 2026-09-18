@@ -31,6 +31,8 @@
 (function (window, navigator) {
     'use strict';
 
+    var support = window.V5idScannerSupport;
+
     // ── BLE constants (Tera HW0009 — from the reference client) ─────────
     var BLE_NAME = 'BarCode Scanner BLE';
     var SVC = '0000feea-0000-1000-8000-00805f9b34fb'; // vendor-custom, same UUID family as the Marson MT810
@@ -53,6 +55,8 @@
     var NOTIFY_DEBOUNCE_MS = 350;
     /** Per-attempt timeout for one CMD_GET_SERIAL request/response round trip. */
     var SERIAL_ATTEMPT_TIMEOUT_MS = 6000;
+    /** Ceiling on those attempts — a unit that stays linked but never answers must not keep connect() pending for the rest of the shift. */
+    var SERIAL_MAX_ATTEMPTS = 5;
     /** Fixed retry cadence once connected — matches the reference client's own indefinite "every 2s until it's back" reconnect loop, rather than escalating backoff. */
     var RECONNECT_INTERVAL_MS = 2000;
 
@@ -117,12 +121,16 @@
 
         /**
          * The device treats the first CMD_GET_SERIAL as a wake-up trigger and
-         * only answers a later one once it's ready — matching the reference
-         * client, this keeps re-sending it until a response arrives or the
-         * link drops, rather than a single request/response.
+         * only answers a later one once it's ready, so this re-sends it —
+         * but a bounded number of times: the reference client's own
+         * indefinite loop leaves connect() pending forever against a unit
+         * that stays linked and never answers.
          */
         async function requestSerialNumber() {
-            while (writeChr && isLinked() && !userDisconnected) {
+            for (var attempt = 1; attempt <= SERIAL_MAX_ATTEMPTS; attempt++) {
+                if (!writeChr || !isLinked() || userDisconnected) {
+                    return null;
+                }
                 try {
                     var responsePromise = waitForNotifyFlush(SERIAL_ATTEMPT_TIMEOUT_MS);
                     await sendCommand(CMD_GET_SERIAL);
@@ -131,42 +139,11 @@
                         return raw;
                     }
                 } catch (e) {
-                    /* no answer this round — loop and retry while still linked */
+                    /* no answer this round — retry while still linked */
                 }
             }
+
             return null;
-        }
-
-        async function getSerialNumber() {
-            var fromCommand = await requestSerialNumber();
-            if (fromCommand) {
-                return fromCommand;
-            }
-
-            // Not part of the reference client (which relies solely on the
-            // vendor command), but consistent with this module's other
-            // adapters: a stable-enough fallback so pairing can still
-            // succeed if the vendor command never answers.
-            return device && device.id ? device.id : null;
-        }
-
-        async function connectGatt(maxAttempts) {
-            maxAttempts = maxAttempts || 4;
-            for (var attempt = 1; attempt <= maxAttempts; attempt++) {
-                try {
-                    var srv = await device.gatt.connect();
-                    await new Promise(function (r) { setTimeout(r, 350); });
-                    if (!device.gatt.connected) {
-                        throw new Error('Link dropped immediately after connect');
-                    }
-                    return srv;
-                } catch (e) {
-                    if (attempt === maxAttempts) {
-                        throw e;
-                    }
-                    await new Promise(function (r) { setTimeout(r, 800 * attempt); });
-                }
-            }
         }
 
         async function setupServices() {
@@ -178,19 +155,7 @@
         }
 
         function onNotify(event) {
-            var text = new TextDecoder('utf-8', { fatal: false }).decode(event.target.value);
-
-            if (pendingSerialResolve) {
-                var raw = text.replace(/[\r\n\x00]/g, '').trim();
-                if (raw.length > 0) {
-                    var resolve = pendingSerialResolve;
-                    pendingSerialResolve = null;
-                    resolve(raw);
-                }
-                return;
-            }
-
-            rxBuffer += text;
+            rxBuffer += new TextDecoder('utf-8', { fatal: false }).decode(event.target.value);
             clearTimeout(flushTimer);
             flushTimer = setTimeout(flushBuffer, NOTIFY_DEBOUNCE_MS);
         }
@@ -198,17 +163,29 @@
         function flushBuffer() {
             var payload = rxBuffer.trim();
             rxBuffer = '';
-            if (payload.length > 0) {
-                processBarcode(payload);
+            if (payload.length === 0) {
+                return;
             }
+
+            // Scan or command response is decided on the whole payload, not
+            // on one notification: this unit delivers a scan as several
+            // chunks (hence the debounce above), and judging each chunk
+            // alone made every chunk after the one carrying the ANSI marker
+            // look like a command response — and made a passport MRZ, which
+            // carries no marker at all, look like one from its first chunk.
+            if (pendingSerialResolve && !support.looksLikeIdScan(payload)) {
+                var raw = payload.replace(/[\r\n\x00]/g, '').trim();
+                if (raw.length > 0) {
+                    var resolve = pendingSerialResolve;
+                    pendingSerialResolve = null;
+                    resolve(raw);
+                    return;
+                }
+            }
+
+            processBarcode(payload);
         }
 
-        // Same AAMVA/ANSI marker + '@' backtrack as the other adapters in
-        // this module — a defensive filter this device's own reference
-        // client doesn't need (it gates on a separate "validation screen"
-        // state this module has no equivalent of), but harmless and
-        // consistent here since we start listening for real scans as soon
-        // as we're connected rather than after a second explicit step.
         function processBarcode(bcData) {
             if (!bcData) {
                 return;
@@ -218,23 +195,13 @@
                 return;
             }
 
-            var ansiIdx = barcodeText.indexOf('ANSI');
-            if (ansiIdx < 0 && barcodeText.length < 50) {
+            var payload = support.extractIdPayload(barcodeText);
+            if (payload === null) {
                 return;
-            }
-            if (ansiIdx >= 0) {
-                var startIdx = ansiIdx;
-                for (var j = ansiIdx - 1; j >= Math.max(0, ansiIdx - 20); j--) {
-                    if (barcodeText[j] === '@') {
-                        startIdx = j;
-                        break;
-                    }
-                }
-                barcodeText = barcodeText.substring(startIdx);
             }
 
             if (typeof onScan === 'function') {
-                onScan(barcodeText);
+                onScan(payload);
             }
         }
 
@@ -267,7 +234,7 @@
                 return;
             }
             try {
-                server = await connectGatt(2);
+                server = await support.connectGatt(device, 2);
                 await setupServices();
                 // Re-arm immediate mode, matching the reference client's own
                 // reconnect path (its initScanner() runs again there too).
@@ -275,6 +242,9 @@
                 stopReconnect();
                 setStatus('connected');
             } catch (e) {
+                // Deliberately unbounded: these units sleep when idle and
+                // must come back on their own when they wake, so a ceiling
+                // would strand a scanner that was simply left alone.
                 scheduleReconnect(RECONNECT_INTERVAL_MS);
             }
         }
@@ -323,13 +293,13 @@
                         device.addEventListener('gattserverdisconnected', handleDisconnect);
                     }
 
-                    server = await connectGatt();
+                    server = await support.connectGatt(device);
                     await setupServices();
 
                     // Serial before Immediate Mode, same order as the
                     // reference client — so the mode-switch command doesn't
                     // block the serial-request loop above it.
-                    var serial = await getSerialNumber();
+                    var serial = await requestSerialNumber();
                     await sendCommand(CMD_IMMEDIATE_MODE);
 
                     setStatus('connected');

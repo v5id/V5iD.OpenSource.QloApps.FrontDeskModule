@@ -137,7 +137,12 @@ class V5idApiClient
     public function validateScan($rawText)
     {
         $rawText = (string) $rawText;
-        $format = (isset($rawText[0]) && $rawText[0] === '@') ? 'barcode' : 'mrz';
+        // An AAMVA barcode normally opens with the '@' compliance
+        // indicator, but some units strip the leading control bytes and
+        // hand over a payload starting at the ANSI marker (see
+        // V5idScannerSupport.extractIdPayload) — that is still a barcode,
+        // and logging it as an MRZ misreports what was scanned.
+        $format = (isset($rawText[0]) && ($rawText[0] === '@' || strncmp($rawText, 'ANSI', 4) === 0)) ? 'barcode' : 'mrz';
 
         $tokenResult = $this->getDeviceToken();
         if (!$tokenResult['success']) {

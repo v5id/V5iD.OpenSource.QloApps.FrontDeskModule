@@ -43,14 +43,11 @@
             protocols[protocol.id] = protocol;
         },
 
-        /** @return {object[]} Every registered protocol, regardless of browser support. */
-        all: function () {
-            return Object.keys(protocols).map(function (id) { return protocols[id]; });
-        },
-
         /** @return {object[]} Registered protocols this browser can actually use. */
         available: function () {
-            return this.all().filter(function (p) {
+            return Object.keys(protocols).map(function (id) {
+                return protocols[id];
+            }).filter(function (p) {
                 try {
                     return !!p.isSupported();
                 } catch (e) {
