@@ -622,6 +622,9 @@
              *   request. Undefined for a plain keyboard-wedge scan (see
              *   scanner-listener.js) — the server reports a clean "no
              *   known device" error for those rather than calling the API.
+             *   A paired scanner that isn't signed in to V5iD comes back
+             *   with result.signInRequired, and the banner offers a way
+             *   into Scanner Manager, where that sign-in happens.
              */
             handleScan: function (raw, serial) {
                 if (!this.idHotel) {
@@ -832,6 +835,9 @@
             '        <span v-if="scanBanner.result.firstName">{{ scanBanner.result.firstName }} {{ scanBanner.result.lastName }}</span>' +
             '        <span v-if="scanBanner.result.age">· {{ scanBanner.result.age }} yrs</span>' +
             '        <span v-if="scanOutcomeDetail(scanBanner.result)">{{ scanOutcomeDetail(scanBanner.result) }}</span>' +
+            '      </div>' +
+            '      <div class="v5idfd-scan-matches" v-if="scanBanner.result.signInRequired && scannerAdapters.length">' +
+            '        <button class="v5idfd-room-chip" @click="openScannerManager">Open Scanner Manager to sign in</button>' +
             '      </div>' +
             '      <div class="v5idfd-scan-matches" v-if="scanBanner.matches && scanBanner.matches.length > 1">' +
             '        <p>Multiple bookings match this name — pick one:</p>' +

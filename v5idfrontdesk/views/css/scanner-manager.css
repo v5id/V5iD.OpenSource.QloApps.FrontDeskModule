@@ -224,3 +224,51 @@ body {
 .v5sm-log-line:first-child {
     border-top: none;
 }
+
+/* V5iD sign-in line on each device row — see buildDeviceRow(). */
+.v5sm-session {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    margin-top: 10px;
+    padding: 8px 10px;
+    border-radius: 6px;
+    font-size: 12px;
+}
+
+.v5sm-session.is-signed-in {
+    background: var(--v5sm-connected-bg);
+    color: var(--v5sm-connected);
+}
+
+.v5sm-session.is-signed-out {
+    background: var(--v5sm-pending-bg);
+    color: #92400e;
+}
+
+.v5sm-session-text {
+    min-width: 0;
+    font-weight: 600;
+}
+
+.v5sm-btn-link {
+    flex-shrink: 0;
+    padding: 4px 10px;
+    border: 1px solid currentColor;
+    border-radius: 6px;
+    background: transparent;
+    color: inherit;
+    font-weight: 600;
+    font-size: 12px;
+    cursor: pointer;
+}
+
+.v5sm-btn-link:hover {
+    background: rgba(255, 255, 255, 0.6);
+}
+
+.v5sm-btn-link:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+}

@@ -4,8 +4,8 @@
  * https://beta.kiosk.v5id.dev/tera-scan-v1.html uses for pairing and
  * scanning. Only the BLE framing and connection-management logic is reused
  * here, same as inateck-ble-adapter.js and marson-ble-adapter.js — this
- * adapter does not talk to the V5iD API directly and never sees the device
- * secret: a decoded scan is just handed to the registry caller's onScan
+ * adapter does not talk to the V5iD API directly and never sees a V5iD
+ * token: a decoded scan is just handed to the registry caller's onScan
  * callback, which the app wires into the same server-side
  * ajaxProcessScanValidate flow used by the keyboard-wedge path.
  *

@@ -10,13 +10,13 @@
  * property must never see or be able to use a scanner registered to another
  * — see getForHotel().
  *
- * This row also doubles as the V5id device token cache (access_token etc.)
- * for this exact physical unit: the V5id API issues a token per device
- * serial, not per property, and rejects a request that doesn't carry one
- * ("Device is not registered") — see V5idApiClient. A serial with no
- * matching row here (e.g. one typed into the settings page's "Test
- * Connection" field) still works against the API, it just has nothing to
- * cache the resulting token onto.
+ * This row also holds the unit's V5id device session (access_token,
+ * refresh_token, token_expires_at, signed_in_at): V5id signs in each
+ * physical serial separately, through the Authorization Code + PKCE flow
+ * staff start from Scanner Manager — see V5idDeviceOAuth. The tokens are
+ * read and written only by V5idDeviceOAuth, and never leave the server:
+ * getForHotel() — the one query whose rows reach the browser — reports the
+ * session as a signed_in flag instead.
  *
  * Copyright (C) 2026  V5iD, Inc.
  *
@@ -48,7 +48,7 @@ class V5idFrontDeskScannerDevice extends ObjectModel
     public $access_token;
     public $refresh_token;
     public $token_expires_at;
-    public $refresh_expires_at;
+    public $signed_in_at;
     public $date_add;
     public $date_upd;
 
@@ -64,7 +64,7 @@ class V5idFrontDeskScannerDevice extends ObjectModel
             'access_token' => array('type' => self::TYPE_STRING),
             'refresh_token' => array('type' => self::TYPE_STRING),
             'token_expires_at' => array('type' => self::TYPE_INT, 'validate' => 'isUnsignedInt'),
-            'refresh_expires_at' => array('type' => self::TYPE_INT, 'validate' => 'isUnsignedInt'),
+            'signed_in_at' => array('type' => self::TYPE_INT, 'validate' => 'isUnsignedInt'),
             'date_add' => array('type' => self::TYPE_DATE, 'validate' => 'isDate'),
             'date_upd' => array('type' => self::TYPE_DATE, 'validate' => 'isDate'),
         ),
@@ -77,6 +77,12 @@ class V5idFrontDeskScannerDevice extends ObjectModel
      * isHotelAccessible()) — this is the one query the whole "which
      * scanners can this property see" boundary rests on.
      *
+     * Its rows go straight to Scanner Manager, so the columns are listed
+     * rather than SELECT *: the V5id tokens stay server-side, and the
+     * session is reported as signed_in instead. A session counts as signed
+     * in while it holds a refresh token — the access token alone expires
+     * within hours and is renewed on the next scan.
+     *
      * @param int $idHotel
      *
      * @return array
@@ -84,10 +90,14 @@ class V5idFrontDeskScannerDevice extends ObjectModel
     public static function getForHotel($idHotel)
     {
         return Db::getInstance()->executeS(
-            'SELECT *
+            'SELECT id, id_hotel, adapter_id, serial, label, active, date_add, date_upd,
+                (refresh_token IS NOT NULL AND refresh_token != "") AS signed_in,
+                signed_in_at
             FROM `'._DB_PREFIX_.'v5idfrontdesk_scanner_device`
             WHERE id_hotel = '.(int) $idHotel.'
-            ORDER BY date_add DESC'
+            ORDER BY date_add DESC',
+            true,
+            false
         );
     }
 
@@ -156,29 +166,70 @@ class V5idFrontDeskScannerDevice extends ObjectModel
     }
 
     /**
-     * Persists a freshly issued/refreshed V5id device token pair onto this
-     * row — see V5idApiClient, which reads it back as this device's cached
-     * token.
+     * The device's current V5id session, read straight from the database
+     * — never from ObjectModel's or Db's per-request caches, since
+     * V5idDeviceOAuth re-reads it after waiting on another request's
+     * refresh and must see what that request just wrote.
      *
-     * @param array $tokenResponse Decoded TokenResponse body from the V5id API.
+     * @param int $idDevice
+     *
+     * @return array{access_token: ?string, refresh_token: ?string, token_expires_at: int}|null
+     */
+    public static function getTokenState($idDevice)
+    {
+        $row = Db::getInstance()->getRow(
+            'SELECT access_token, refresh_token, token_expires_at
+            FROM `'._DB_PREFIX_.'v5idfrontdesk_scanner_device`
+            WHERE id = '.(int) $idDevice,
+            false
+        );
+
+        return $row ?: null;
+    }
+
+    /**
+     * Persists a token pair from V5id's /oauth/token onto this device.
+     * Written with a plain UPDATE rather than ObjectModel::update(), which
+     * would also write back every other field as this request last loaded
+     * it — possibly stale by the time a refresh lock was acquired.
+     *
+     * @param int $idDevice
+     * @param array $tokenResponse Validated V5id token response.
+     * @param bool $isNewSignIn True for a code exchange; false for a refresh, which keeps the original sign-in time.
      *
      * @return bool
      */
-    public function storeTokenPair(array $tokenResponse)
+    public static function storeSession($idDevice, array $tokenResponse, $isNewSignIn)
     {
-        $expiresIn = isset($tokenResponse['expires_in']) ? (int) $tokenResponse['expires_in'] : 0;
-
-        $this->access_token = isset($tokenResponse['access_token']) ? $tokenResponse['access_token'] : null;
-        $this->token_expires_at = time() + $expiresIn;
-
-        if (!empty($tokenResponse['refresh_token'])) {
-            $this->refresh_token = $tokenResponse['refresh_token'];
-            $this->refresh_expires_at = time() + (7 * 86400);
+        $now = time();
+        $fields = array(
+            'access_token' => pSQL($tokenResponse['access_token']),
+            'refresh_token' => pSQL($tokenResponse['refresh_token']),
+            'token_expires_at' => $now + (int) $tokenResponse['expires_in'],
+            'date_upd' => date('Y-m-d H:i:s', $now),
+        );
+        if ($isNewSignIn) {
+            $fields['signed_in_at'] = $now;
         }
 
-        $this->date_upd = date('Y-m-d H:i:s');
+        return (bool) Db::getInstance()->update('v5idfrontdesk_scanner_device', $fields, 'id = '.(int) $idDevice);
+    }
 
-        return (bool) $this->update();
+    /**
+     * Forgets this device's V5id session. Does not revoke it at V5id —
+     * see V5idDeviceOAuth::signOut() for that.
+     *
+     * @param int $idDevice
+     *
+     * @return bool
+     */
+    public static function clearSession($idDevice)
+    {
+        return (bool) Db::getInstance()->execute(
+            'UPDATE `'._DB_PREFIX_.'v5idfrontdesk_scanner_device`
+            SET access_token = NULL, refresh_token = NULL, token_expires_at = 0, signed_in_at = NULL
+            WHERE id = '.(int) $idDevice
+        );
     }
 
     /**

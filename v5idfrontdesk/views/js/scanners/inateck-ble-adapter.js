@@ -15,7 +15,7 @@
  * Protocol/GATT layout adapted from V5id's own reference client at
  * https://dev.kiosk.v5id.dev/inateck-scan-v1.html — only the BLE framing
  * and connection-management logic is reused here. This adapter does not
- * talk to the V5iD API directly and never sees the device secret: a
+ * talk to the V5iD API directly and never sees a V5iD token: a
  * decoded scan is just handed to the registry caller's `onScan` callback,
  * which the app wires into the same server-side ajaxProcessScanValidate
  * flow used by the keyboard-wedge path.

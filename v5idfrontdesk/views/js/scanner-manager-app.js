@@ -16,6 +16,12 @@
  * (isHotelAccessible()) rather than trusting this page to have asked for
  * the right hotel in the first place.
  *
+ * It is also where each paired scanner signs in to V5iD (see
+ * signInDevice() below): V5iD authorizes every serial separately, through
+ * its own sign-in page, where staff type the property's integration key.
+ * The session itself stays on the server — this page only ever sees
+ * whether a scanner is signed in.
+ *
  * Deliberately framework-free (no Vue): this is a small, self-contained
  * control panel, and keeping it free of the board's app shell means a
  * problem loading/rendering the board can never take this tab down with it.
@@ -40,6 +46,12 @@
     };
 
     var MAX_LOG_LINES = 5;
+
+    /** Must match V5idFrontDeskOauthcallbackModuleFrontController::MESSAGE_TYPE. */
+    var SIGN_IN_MESSAGE_TYPE = 'v5id-device-oauth-result';
+
+    /** Matches V5idDeviceOAuth::TRANSACTION_TTL: the server forgets the sign-in after this anyway. */
+    var SIGN_IN_TIMEOUT_MS = 10 * 60 * 1000;
 
     function el(tag, className, text) {
         var node = document.createElement(tag);
@@ -90,6 +102,103 @@
     }
 
     /**
+     * Runs one scanner's V5iD sign-in in a popup: V5iD's own page, where
+     * staff type the integration key, then this module's callback page,
+     * which finishes the sign-in server-side and reports back here.
+     *
+     * The popup is opened before anything asynchronous happens — browsers
+     * only allow window.open() straight from the click — and pointed at
+     * V5iD once the server has created the sign-in and returned its URL.
+     *
+     * @param {object} device Row from GetScannerDevices.
+     *
+     * @return {Promise<?{ok: boolean, message: string}>} Resolves with the callback's
+     *   report, or null if the window was closed without one — the caller
+     *   re-reads the real status from the server either way.
+     */
+    function signInDevice(device) {
+        return new Promise(function (resolve) {
+            var popup = window.open('', 'v5id-signin-' + device.id, 'popup=yes,width=560,height=720,resizable=yes,scrollbars=yes');
+            if (!popup) {
+                resolve({ ok: false, message: 'The browser blocked the sign-in window. Allow pop-ups for this page, then try again.' });
+                return;
+            }
+            try {
+                popup.document.title = 'V5iD sign-in';
+                popup.document.body.textContent = 'Opening V5iD sign-in…';
+            } catch (e) {
+                /* cosmetic only */
+            }
+
+            var finished = false;
+            var closedPoll = null;
+            var timeout = null;
+
+            function finish(result) {
+                if (finished) {
+                    return;
+                }
+                finished = true;
+                window.removeEventListener('message', onMessage);
+                window.clearInterval(closedPoll);
+                window.clearTimeout(timeout);
+                resolve(result);
+            }
+
+            // The callback page is served from the shop's front office,
+            // which need not share this back-office page's origin, so the
+            // message is matched on the window it came from instead. It only
+            // carries ok/message, and nothing is trusted from it beyond
+            // "re-read the status now".
+            function onMessage(event) {
+                if (event.source !== popup || !event.data || event.data.type !== SIGN_IN_MESSAGE_TYPE) {
+                    return;
+                }
+                finish({ ok: !!event.data.ok, message: String(event.data.message || '') });
+            }
+
+            window.addEventListener('message', onMessage);
+            closedPoll = window.setInterval(function () {
+                if (popup.closed) {
+                    finish(null);
+                }
+            }, 500);
+            timeout = window.setTimeout(function () {
+                if (!popup.closed) {
+                    popup.close();
+                }
+                finish({ ok: false, message: 'The sign-in was not finished in time. Try again.' });
+            }, SIGN_IN_TIMEOUT_MS);
+
+            api('StartDeviceSignIn', { id_hotel: config.idHotel, id_device: device.id }).then(function (res) {
+                if (finished) {
+                    return;
+                }
+                if (!res.success) {
+                    popup.close();
+                    finish({ ok: false, message: res.message || 'Could not start the V5iD sign-in.' });
+                    return;
+                }
+                popup.location.replace(res.authorizeUrl);
+            }).catch(function (err) {
+                if (!popup.closed) {
+                    popup.close();
+                }
+                finish({ ok: false, message: (err && err.message) ? err.message : 'Could not start the V5iD sign-in.' });
+            });
+        });
+    }
+
+    /**
+     * @param {object} device Row from GetScannerDevices.
+     *
+     * @return {boolean}
+     */
+    function isSignedIn(device) {
+        return device.signed_in === true || device.signed_in === 1 || device.signed_in === '1';
+    }
+
+    /**
      * One row for an already-known, previously-paired device — id_hotel,
      * adapter_id and serial (see V5idFrontDeskScannerDevice) identify this
      * exact physical unit server-side. The browser chooser still appears on
@@ -98,11 +207,12 @@
      * stored serial buys is the check below that the unit actually chosen is
      * the one this row was paired with.
      *
-     * @param {object} device Row from GetScannerDevices — {id, adapter_id, serial, label}.
+     * @param {object} device Row from GetScannerDevices — {id, adapter_id, serial, label, signed_in, signed_in_at}.
      * @param {Element} root
      * @param {function():void} onRemoved Called once the device is deleted server-side.
+     * @param {function():void} onSessionChanged Called after a sign-in/sign-out, to re-read every row's session.
      */
-    function buildDeviceRow(device, root, onRemoved) {
+    function buildDeviceRow(device, root, onRemoved, onSessionChanged) {
         var protocol = registry.get(device.adapter_id);
         // registry.available() already wraps isSupported() in the same
         // try/catch this used to repeat.
@@ -127,9 +237,69 @@
         actions.appendChild(removeBtn);
         row.appendChild(actions);
 
+        // V5iD sign-in: separate from the Bluetooth/HID connection above —
+        // a scanner can be signed in while unplugged, and connected while
+        // signed out (its scans then fail with "sign in" on the board).
+        var session = el('div', 'v5sm-session');
+        var sessionText = el('span', 'v5sm-session-text');
+        var sessionBtn = el('button', 'v5sm-btn-link');
+        session.appendChild(sessionText);
+        session.appendChild(sessionBtn);
+        row.appendChild(session);
+
         var log = el('div', 'v5sm-log');
         row.appendChild(log);
         var logLine = makeLogger(log);
+
+        var signedIn = false;
+        var sessionBusy = false;
+
+        function renderSession(latest) {
+            signedIn = isSignedIn(latest);
+            session.className = 'v5sm-session ' + (signedIn ? 'is-signed-in' : 'is-signed-out');
+            var since = Number(latest.signed_in_at);
+            sessionText.textContent = signedIn
+                ? 'Signed in to V5iD' + (since ? ' · ' + new Date(since * 1000).toLocaleString() : '')
+                : 'Not signed in to V5iD — scans won’t validate';
+            sessionBtn.textContent = signedIn ? 'Sign out' : 'Sign in to V5iD';
+            sessionBtn.disabled = sessionBusy;
+        }
+
+        renderSession(device);
+
+        sessionBtn.addEventListener('click', function () {
+            if (sessionBusy) {
+                return;
+            }
+
+            if (signedIn) {
+                if (!window.confirm('Sign "' + device.label + '" out of V5iD? Its scans stop validating until it is signed in again.')) {
+                    return;
+                }
+                sessionBusy = true;
+                sessionBtn.disabled = true;
+                api('SignOutDevice', { id_hotel: config.idHotel, id_device: device.id }).then(function (res) {
+                    logLine(res.success ? 'Signed out of V5iD.' : (res.message || 'Could not sign out.'));
+                }).catch(function (err) {
+                    logLine((err && err.message) ? err.message : 'Could not sign out.');
+                }).then(function () {
+                    sessionBusy = false;
+                    onSessionChanged();
+                });
+                return;
+            }
+
+            sessionBusy = true;
+            sessionBtn.disabled = true;
+            sessionText.textContent = 'Waiting for V5iD sign-in…';
+            signInDevice(device).then(function (result) {
+                if (result) {
+                    logLine(result.ok ? 'Signed in to V5iD.' : 'Sign-in failed: ' + result.message);
+                }
+                sessionBusy = false;
+                onSessionChanged();
+            });
+        });
 
         function reportError(message) {
             channel.send('error', { deviceId: device.id, adapterId: device.adapter_id, message: message });
@@ -226,6 +396,9 @@
                 identityConfirmed = true;
                 heldScans.forEach(forwardScan);
                 heldScans = [];
+                if (!signedIn) {
+                    logLine('Connected, but not signed in to V5iD — click "Sign in to V5iD" so its scans can be validated.');
+                }
             }).catch(function () {
                 // Status/error already reported through the callbacks above
                 // (e.g. the user cancelled the device chooser).
@@ -270,6 +443,12 @@
             // BroadcastChannel only delivers messages to listeners that were
             // already attached when postMessage() ran.
             currentStatus: function () { return { deviceId: device.id, adapterId: device.adapter_id, status: status }; },
+            id: device.id,
+            updateSession: function (latest) {
+                if (!sessionBusy) {
+                    renderSession(latest);
+                }
+            },
         };
     }
 
@@ -358,7 +537,7 @@
                     label: label,
                 }).then(function (res) {
                     if (res.success) {
-                        logLine('Paired as "' + label + '" — click Connect on it below to start using it.');
+                        logLine('Paired as "' + label + '" — click "Sign in to V5iD" on it below, then Connect.');
                         onPaired(res.devices);
                     } else {
                         logLine(res.message || 'Could not save this scanner.');
@@ -417,9 +596,36 @@
                     rows.splice(index, 1);
                 }
                 delete renderedIds[device.id];
-            });
+            }, refreshSessions);
             rows.push(entry);
         }
+
+        // After any sign-in/sign-out, and whenever this tab comes back into
+        // view: a session can also end elsewhere (sign-out from another
+        // tab, the property's integration changing, V5iD ending it), and the
+        // server is the only place that knows.
+        function refreshSessions() {
+            api('GetScannerDevices', { id_hotel: config.idHotel }).then(function (res) {
+                if (!res.success) {
+                    return;
+                }
+                res.devices.forEach(function (latest) {
+                    rows.forEach(function (row) {
+                        if (String(row.id) === String(latest.id)) {
+                            row.updateSession(latest);
+                        }
+                    });
+                });
+            }).catch(function () {
+                /* keep showing the last known state */
+            });
+        }
+
+        document.addEventListener('visibilitychange', function () {
+            if (document.visibilityState === 'visible') {
+                refreshSessions();
+            }
+        });
 
         api('GetScannerDevices', { id_hotel: config.idHotel }).then(function (res) {
             if (!res.success) {

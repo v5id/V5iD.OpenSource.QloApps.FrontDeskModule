@@ -103,11 +103,6 @@ class AdminV5idFrontDeskController extends ModuleAdminController
         // AJAX calls (GetScannerDevices etc.) need the tables to already exist.
         $this->module->ensureTablesUpToDate();
 
-        // And the one-time copy of the old global V5id credential into a
-        // starting row per hotel — must run after ensureTablesUpToDate()
-        // above, since it writes into the table that call just created.
-        $this->module->migrateGlobalCredentialToHotels();
-
         // The Scanner Manager page renders its own standalone HTML document
         // (see renderScannerManagerPage()) instead of the back-office theme,
         // so none of the assets queued below ever get output for it — the
@@ -642,10 +637,10 @@ class AdminV5idFrontDeskController extends ModuleAdminController
         }
 
         // Set only for scans relayed from a Scanner Manager-paired device
-        // (see frontdesk-app.js) — the V5id API requires a device serial on
-        // every token request, so a plain keyboard-wedge scan (no paired
-        // device, no serial) fails cleanly inside V5idApiClient rather than
-        // reaching the API with a request it's guaranteed to reject.
+        // (see frontdesk-app.js) — V5id signs in each device serial
+        // separately, so a plain keyboard-wedge scan (no paired device, no
+        // serial, no session) fails cleanly inside V5idApiClient rather
+        // than reaching the API with a request it's guaranteed to reject.
         $serial = trim((string) Tools::getValue('device_serial'));
 
         $client = new V5idApiClient($idHotel, $serial);
@@ -931,6 +926,11 @@ class AdminV5idFrontDeskController extends ModuleAdminController
             $this->dieError($this->l('Scanner not found.'));
         }
 
+        // Deleting the row alone would only forget the session here, and
+        // leave it redeemable at V5id until it expires.
+        V5idDeviceOAuth::signOut($device);
+        V5idFrontDeskOAuthTransaction::deleteForDevice($device->id);
+
         if (!$device->delete()) {
             $this->dieError($this->l('Could not remove this scanner. Please try again.'));
         }
@@ -939,6 +939,62 @@ class AdminV5idFrontDeskController extends ModuleAdminController
             'success' => true,
             'devices' => V5idFrontDeskScannerDevice::getForHotel($idHotel) ?: array(),
         )));
+    }
+
+    // -----------------------------------------------------------------
+    // V5iD device sign-in (Scanner Manager)
+    // -----------------------------------------------------------------
+
+    /**
+     * Starts a V5iD sign-in for one paired scanner and returns the URL
+     * Scanner Manager opens in its sign-in popup. Everything that must stay
+     * secret (the PKCE verifier) or must not be chosen by the browser
+     * (which device, which integration) is fixed server-side here — see
+     * V5idDeviceOAuth::startAuthorization(). The popup comes back through
+     * controllers/front/oauthcallback.php, which finishes the sign-in.
+     */
+    public function ajaxProcessStartDeviceSignIn()
+    {
+        $device = $this->requireHotelDevice();
+
+        $result = V5idDeviceOAuth::startAuthorization($device, (int) $this->context->employee->id);
+        if (!$result['success']) {
+            $this->dieError($result['message']);
+        }
+
+        $this->ajaxDie(json_encode(array('success' => true, 'authorizeUrl' => $result['authorize_url'])));
+    }
+
+    /**
+     * Ends one scanner's V5iD session, here and at V5iD.
+     */
+    public function ajaxProcessSignOutDevice()
+    {
+        $device = $this->requireHotelDevice();
+
+        V5idDeviceOAuth::signOut($device);
+
+        $this->ajaxDie(json_encode(array(
+            'success' => true,
+            'devices' => V5idFrontDeskScannerDevice::getForHotel($device->id_hotel) ?: array(),
+        )));
+    }
+
+    /**
+     * @return V5idFrontDeskScannerDevice The id_device scanner, verified to belong to the
+     *                                    requested (and accessible) id_hotel — see
+     *                                    ajaxProcessDeleteScannerDevice() for why both checks.
+     */
+    private function requireHotelDevice()
+    {
+        $idHotel = $this->requireAccessibleHotel();
+
+        $device = new V5idFrontDeskScannerDevice((int) Tools::getValue('id_device'));
+        if (!Validate::isLoadedObject($device) || (int) $device->id_hotel !== $idHotel) {
+            $this->dieError($this->l('Scanner not found.'));
+        }
+
+        return $device;
     }
 
     /**
