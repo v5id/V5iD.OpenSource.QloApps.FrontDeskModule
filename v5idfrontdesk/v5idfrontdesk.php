@@ -121,7 +121,7 @@ class V5idFrontDesk extends Module
     {
         $this->name = 'v5idfrontdesk';
         $this->tab = 'administration';
-        $this->version = '1.0.0';
+        $this->version = '1.1.0';
         $this->author = 'V5iD, Inc.';
         $this->need_instance = 0;
         $this->bootstrap = true;
